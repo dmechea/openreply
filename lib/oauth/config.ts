@@ -14,6 +14,10 @@ export const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 // Sliding: every refresh issues a new refresh token with a fresh lifetime, so
 // a connection in regular use never expires.
 export const REFRESH_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;
+// How long after its first use a refresh token can be used again: a client
+// whose access token runs out during parallel calls refreshes from each of
+// them with the same refresh token.
+export const REFRESH_REUSE_GRACE_SECONDS = 30;
 export const AUTHORIZATION_CODE_TTL_SECONDS = 5 * 60;
 
 /** The known scopes among `values`, in canonical order, unknown ones dropped. */

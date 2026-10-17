@@ -16,7 +16,7 @@ import {
   type JSONRPCMessage,
   type RequestId,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readBodyText } from "@/lib/oauth/body";
+import { closingConnection, readBodyText } from "@/lib/oauth/body";
 import { issuer } from "@/lib/oauth/config";
 import { authenticateAccessToken, type McpCaller } from "@/lib/oauth/connections";
 import { mcpUnauthorized } from "@/lib/oauth/http";
@@ -55,7 +55,9 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
   try {
     const text = await readBodyText(request, DEFAULT_MAX_REQUEST_BODY_SIZE);
     if (text === null) {
-      return jsonRpcRefusal(413, requestBodyTooLargeMessage(DEFAULT_MAX_REQUEST_BODY_SIZE));
+      return closingConnection(
+        jsonRpcRefusal(413, requestBodyTooLargeMessage(DEFAULT_MAX_REQUEST_BODY_SIZE))
+      );
     }
     body = JSON.parse(text);
   } catch {

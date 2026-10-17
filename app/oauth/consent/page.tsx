@@ -29,6 +29,13 @@ function destinationOf(redirectUri: string) {
   return `${url.protocol}${url.host ? `//${url.host}` : ""}${url.pathname}`;
 }
 
+// The app's name, set apart from the sentence it is shown in (U+2068 FIRST
+// STRONG ISOLATE to U+2069 POP DIRECTIONAL ISOLATE), so a right-to-left name
+// reads correctly and no character in it can reorder the words around it.
+function isolated(name: string) {
+  return `\u2068${name}\u2069`;
+}
+
 // The page around either the consent form or the reason there is none.
 function ConsentFrame({ children }: { children: ReactNode }) {
   return (
@@ -79,7 +86,7 @@ export default async function ConsentPage({
     select: { email: true, name: true },
   });
   const canManage = canManageWorkspace(context.role);
-  const client = check.request.client.name;
+  const client = isolated(check.request.client.name);
   const scopeText: Record<Scope, string> = {
     read: t("{client} will be able to see your campaigns and their results, your posts and reels, and your DM conversations.", { client }),
     "campaigns:write": t("{client} will be able to create and edit campaigns, and switch them on or off.", { client }),
@@ -145,7 +152,7 @@ export default async function ConsentPage({
               type="submit"
               name="decision"
               value="allow"
-              className="flex-1 rounded bg-accent px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-accent-hover"
+              className="flex-1 cursor-pointer rounded bg-accent px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-accent-hover"
             >
               {t("Allow")}
             </button>
@@ -154,7 +161,7 @@ export default async function ConsentPage({
             type="submit"
             name="decision"
             value="cancel"
-            className="flex-1 rounded border border-border px-6 py-3 text-sm font-medium text-muted transition-colors hover:border-border-hover hover:text-foreground"
+            className="flex-1 cursor-pointer rounded border border-border px-6 py-3 text-sm font-medium text-muted transition-colors hover:border-border-hover hover:text-foreground"
           >
             {t("Cancel")}
           </button>

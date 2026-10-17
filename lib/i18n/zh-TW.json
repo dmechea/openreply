@@ -103,6 +103,7 @@
   "Could not accept invitation": "無法接受邀請",
   "Could not change language. Please try again.": "無法切換語言，請再試一次。",
   "Could not invite member": "無法邀請成員",
+  "Could not copy. The URL is selected, so copy it from there.": "無法複製。網址已選取，請直接從那裡複製。",
   "Could not load connected apps": "無法載入已連結的應用程式",
   "Could not load connection.": "無法載入連線狀態。",
   "Could not revoke the connection": "無法撤銷連結",

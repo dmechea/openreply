@@ -1,4 +1,4 @@
-import { readBodyText } from "@/lib/oauth/body";
+import { closingConnection, readBodyText } from "@/lib/oauth/body";
 import { registerClient } from "@/lib/oauth/clients";
 import { corsPreflight, oauthError, oauthJson } from "@/lib/oauth/http";
 
@@ -12,7 +12,9 @@ export async function POST(request: Request) {
   try {
     const text = await readBodyText(request, BODY_LIMIT_BYTES);
     if (text === null) {
-      return oauthError("invalid_client_metadata", "The registration request is too large");
+      return closingConnection(
+        oauthError("invalid_client_metadata", "The registration request is too large")
+      );
     }
     metadata = JSON.parse(text);
   } catch {

@@ -24,3 +24,16 @@ export async function readBodyText(request: Request, limit: number): Promise<str
   }
   return new TextDecoder().decode(Buffer.concat(chunks));
 }
+
+/**
+ * `refusal`, for a body readBodyText found too large, set to close the
+ * connection once it is sent. The rest of the body is left unread, and on a
+ * kept-alive connection it would sit ahead of the next request, which would
+ * then never be answered. A client still sending the body may see the
+ * connection reset instead of the refusal; only a body over the limit, which
+ * no real client sends, is answered this way.
+ */
+export function closingConnection(refusal: Response): Response {
+  refusal.headers.set("Connection", "close");
+  return refusal;
+}

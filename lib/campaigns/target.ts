@@ -15,10 +15,12 @@ export type CampaignTarget =
 
 /**
  * A target as someone chooses it, so a post target always names its post.
- * The MCP tools take it in this shape, described for the client.
+ * The MCP tools take it in this shape, described for the client. A key its
+ * type does not take is refused rather than dropped, so a post meant for a
+ * post target cannot quietly leave a campaign on any post.
  */
 export const chosenTargetSchema = z.discriminatedUnion("type", [
-  z.object({
+  z.strictObject({
     type: z.literal("post"),
     postId: z
       .string()
@@ -31,8 +33,8 @@ export const chosenTargetSchema = z.discriminatedUnion("type", [
         "Its permalink from list_posts, shown in the dashboard. When left out, the campaign's current post keeps its own, and another post's is taken from Instagram"
       ),
   }),
-  z.object({ type: z.literal("any_post") }),
-  z.object({ type: z.literal("next_reel") }),
+  z.strictObject({ type: z.literal("any_post") }),
+  z.strictObject({ type: z.literal("next_reel") }),
 ]);
 
 export type ChosenTarget = z.infer<typeof chosenTargetSchema>;

@@ -11,6 +11,7 @@ import {
   StreamableHTTPError,
 } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { DEFAULT_MAX_REQUEST_BODY_SIZE } from "@modelcontextprotocol/sdk/server/requestBody.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { DEFAULT_REQUEST_TIMEOUT_MSEC } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { ErrorCode, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -928,6 +929,7 @@ describe.skipIf(!hasTestDatabase)("the OpenReply MCP endpoint", () => {
     it.each([
       ["no target", { target: undefined }, /target/],
       ["a post target without a post", { target: { type: "post" } }, /postId/],
+      ["a target with a key its type does not take", { target: { type: "any_post", postId: "media_reel" } }, /postId/],
       ["more than ten keywords", { keywords: Array.from({ length: 11 }, (_, i) => `K${i}`) }, /keywords/],
       ["no keywords", { keywords: [] }, /Add at least one keyword, or match any word/],
       ["a DM over 1000 characters", { dmMessage: "x".repeat(1001) }, /dmMessage/],
@@ -1001,6 +1003,25 @@ describe.skipIf(!hasTestDatabase)("the OpenReply MCP endpoint", () => {
         openingDmEnabled: true,
       });
       expect(errorText(opening)).toMatch(/Opening DM needs a message and a button label/);
+    });
+
+    it("refuses a target with a key its type does not take, keeping the campaign's own", async () => {
+      const campaign = await createViaMcp({ ...minimalCampaign, target: { type: "post", postId: "media_reel" } });
+      const result = await full
+        .callTool({
+          name: "update_campaign",
+          arguments: { campaignId: campaign.id, target: { type: "any_post", postId: "media_reel" } },
+        })
+        .then(
+          (r) => r as CallToolResult,
+          (error: Error) => ({ isError: true, content: [{ type: "text", text: error.message }] }) as CallToolResult
+        );
+      expect(errorText(result)).toMatch(/postId/);
+      expect(await db.prisma.automation.findUniqueOrThrow({ where: { id: campaign.id } })).toMatchObject({
+        postId: "media_reel",
+        matchAnyPost: false,
+        pendingNextReel: false,
+      });
     });
 
     describe("an imported campaign that breaks today's create rules", () => {
@@ -1884,6 +1905,37 @@ describe.skipIf(!hasTestDatabase)("the OpenReply MCP endpoint", () => {
         { jsonrpc: "2.0", id: 2, error: { code: ErrorCode.RequestTimeout, message: expect.any(String) } },
       ]);
       expect(instagram.sends.length).toBe(before + 1);
+    });
+
+    it("refuses a body over the limit, declared or not, and closes the connection after", async () => {
+      // Whatever of the body is still unread when the refusal goes out would
+      // otherwise sit ahead of the next request on a kept-alive connection.
+      const size = DEFAULT_MAX_REQUEST_BODY_SIZE + 1;
+      const chunk = new Uint8Array(64 * 1024).fill(32);
+      function oversized() {
+        let sent = 0;
+        return new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (sent >= size) return controller.close();
+            sent += chunk.byteLength;
+            controller.enqueue(chunk);
+          },
+        });
+      }
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        Authorization: `Bearer ${accessToken}`,
+      };
+      for (const declared of [{ "Content-Length": String(size) }, {}]) {
+        const res = await post(null, {
+          body: oversized(),
+          duplex: "half",
+          headers: { ...headers, ...declared },
+        } as RequestInit);
+        expect(res.status).toBe(413);
+        expect(res.headers.get("connection")).toBe("close");
+      }
     });
 
     it("refuses a body the client stops sending partway, as it refuses one that is not JSON", async () => {

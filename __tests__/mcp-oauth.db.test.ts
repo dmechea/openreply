@@ -12,6 +12,7 @@ import { NextRequest } from "next/server";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCALE_COOKIE } from "../lib/i18n";
+import { REFRESH_REUSE_GRACE_SECONDS } from "../lib/oauth/config";
 import ptBR from "../lib/i18n/pt-BR.json";
 import zhTW from "../lib/i18n/zh-TW.json";
 import { hasTestDatabase, openTestDatabase, type TestDatabase } from "./support/database";
@@ -248,6 +249,20 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect((await res.json()).error).toMatch(/^invalid_(redirect_uri|client_metadata)$/);
     });
 
+    it("strips the characters that reorder text from an app's name", async () => {
+      const res = await registerRequest({
+        client_name: "\u202EClaude\u202C \u2067for\u2069 Work\u200F",
+        redirect_uris: [CLAUDE_REDIRECT],
+      });
+      const body = await res.json();
+      expect(body.client_name).toBe("Claude for Work");
+      const stored = await db.prisma.oAuthClient.findUniqueOrThrow({ where: { id: body.client_id } });
+      expect(stored.name).toBe("Claude for Work");
+
+      const onlyControls = await registerRequest({ client_name: "\u202E\u2066", redirect_uris: [CLAUDE_REDIRECT] });
+      expect((await onlyControls.json()).client_name).toBe("Unnamed app");
+    });
+
     it("refuses a body that is not JSON", async () => {
       const res = await registerRequest("redirect_uris=nope");
       expect(res.status).toBe(400);
@@ -268,6 +283,9 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(res.status).toBe(400);
       expect((await res.json()).error).toBe("invalid_client_metadata");
       expect(declared.pulled.bytes).toBeLessThan(10_000);
+      // What is left unread would otherwise sit ahead of the next request on
+      // a kept-alive connection.
+      expect(res.headers.get("connection")).toBe("close");
 
       const undeclared = streamedBody(5_000_000);
       const chunked = await registerRoute(
@@ -276,6 +294,7 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(chunked.status).toBe(400);
       expect((await chunked.json()).error).toBe("invalid_client_metadata");
       expect(undeclared.pulled.bytes).toBeLessThan(100_000);
+      expect(chunked.headers.get("connection")).toBe("close");
     });
 
     it("drops a client nobody approved within 30 days when another one registers", async () => {
@@ -622,7 +641,7 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       params.append("client_id", "not-a-client");
       const { location, html } = await consentPage(params);
       expect(location).toBeNull();
-      expect(html).toContain("Connect Claude to OpenReply?");
+      expect(html).toContain("Connect \u2068Claude\u2069 to OpenReply?");
       expect(html).toContain(`name="client_id" value="${clientId}"`);
       expect(html).not.toContain("not-a-client");
     });
@@ -667,10 +686,22 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
         const { html } = await consentPage(
           authorizationParams({ clientId: lookalike, challenge: pkce().challenge, redirectUri })
         );
-        expect(html).toContain("Connect Claude to OpenReply?");
+        expect(html).toContain("Connect \u2068Claude\u2069 to OpenReply?");
         expect(html).toContain(`sent back to ${shown}.`);
         expect(html).not.toContain("sent back to claude.ai.");
       }
+    });
+
+    it("sets the app's name apart, so it cannot reorder the sentences around it", async () => {
+      signInAs(ownerId);
+      const clientId = await registerClient();
+      // Set directly, since registration now strips such characters.
+      await db.prisma.oAuthClient.update({ where: { id: clientId }, data: { name: "\u202EClaude" } });
+      const { html } = await consentPage(authorizationParams({ clientId, challenge: pkce().challenge }));
+      expect(html).toContain("Connect \u2068\u202EClaude\u2069 to OpenReply?");
+      expect(html).toContain(
+        "\u2068\u202EClaude\u2069 will be able to see your campaigns and their results"
+      );
     });
   });
 
@@ -836,12 +867,14 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(res.status).toBe(400);
       expect((await res.json()).error).toBe("invalid_request");
       expect(declared.pulled.bytes).toBeLessThan(10_000);
+      expect(res.headers.get("connection")).toBe("close");
 
       const undeclared = streamedBody(5_000_000);
       const chunked = await tokenRoute(streamedPost("/api/oauth/token", form, undeclared.body));
       expect(chunked.status).toBe(400);
       expect((await chunked.json()).error).toBe("invalid_request");
       expect(undeclared.pulled.bytes).toBeLessThan(100_000);
+      expect(chunked.headers.get("connection")).toBe("close");
     });
   });
 
@@ -861,16 +894,43 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(third.status).toBe(200);
     });
 
-    it("revokes the connection when a rotated refresh token is used again", async () => {
+    it("gives each of several refreshes at once with the same token a working pair", async () => {
+      // A client whose access token runs out during parallel calls refreshes
+      // from each of them with the refresh token they all hold.
+      const tokens = await connect({ userId: ownerId });
+      const answers = await Promise.all(
+        Array.from({ length: 4 }, () => refresh(tokens.clientId, tokens.refresh_token))
+      );
+      expect(answers.map((res) => res.status)).toEqual([200, 200, 200, 200]);
+      const pairs = await Promise.all(answers.map((res) => res.json()));
+      expect(new Set(pairs.map((pair) => pair.refresh_token)).size).toBe(4);
+      for (const pair of pairs) {
+        expect((await mcpInitialize(`Bearer ${pair.access_token}`)).status).toBe(200);
+      }
+      // Whichever pair the client keeps carries on rotating.
+      expect((await refresh(tokens.clientId, pairs[3].refresh_token)).status).toBe(200);
+    });
+
+    it("revokes the connection when a rotated refresh token comes back after a moment's grace", async () => {
       const tokens = await connect({ userId: ownerId });
       const next = await (await refresh(tokens.clientId, tokens.refresh_token)).json();
+      // Straight away, it is taken as another of the client's own calls.
+      const sibling = await (await refresh(tokens.clientId, tokens.refresh_token)).json();
+      expect(sibling.access_token).toEqual(expect.any(String));
 
+      // The grace runs from the token's first use, however often it comes back.
+      await db.prisma.oAuthToken.update({
+        where: { tokenHash: hashOf(tokens.refresh_token) },
+        data: { rotatedAt: new Date(Date.now() - (REFRESH_REUSE_GRACE_SECONDS + 1) * 1000) },
+      });
       const replay = await refresh(tokens.clientId, tokens.refresh_token);
       expect(replay.status).toBe(400);
       expect((await replay.json()).error).toBe("invalid_grant");
 
-      expect((await mcpInitialize(`Bearer ${next.access_token}`)).status).toBe(401);
-      expect((await refresh(tokens.clientId, next.refresh_token)).status).toBe(400);
+      for (const pair of [next, sibling]) {
+        expect((await mcpInitialize(`Bearer ${pair.access_token}`)).status).toBe(401);
+        expect((await refresh(tokens.clientId, pair.refresh_token)).status).toBe(400);
+      }
     });
 
     it("refuses an expired refresh token and another client's", async () => {

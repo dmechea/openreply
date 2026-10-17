@@ -3,6 +3,7 @@ import { prisma } from "@/lib/db/client";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   formatScopes,
+  REFRESH_REUSE_GRACE_SECONDS,
   REFRESH_TOKEN_TTL_SECONDS,
 } from "@/lib/oauth/config";
 import { findClient } from "@/lib/oauth/clients";
@@ -13,7 +14,9 @@ import { generateSecret, hashSecret, verifyPkce } from "@/lib/oauth/secrets";
  * The token endpoint's two grants. Authorization codes work once. Refresh
  * tokens rotate: each refresh spends the old one and issues a new pair, and a
  * spent refresh token presented again is taken as stolen, so its whole
- * connection is revoked (OAuth 2.1 §4.3.1).
+ * connection is revoked (OAuth 2.1 §4.3.1). The one exception is a token
+ * presented again within moments of its first use, which is taken as the same
+ * client refreshing from several calls at once, and gets a pair of its own.
  */
 
 export type TokenResult =
@@ -179,15 +182,15 @@ async function refreshAccessToken(params: URLSearchParams): Promise<TokenResult>
 
   // Spending the presented token and issuing its successor are one
   // transaction, so if issuing fails the token stays unspent and the client
-  // can try again. A token already spent, a moment ago or long since, has
-  // been used twice.
+  // can try again. A token spent longer ago than the grace allows has been
+  // used twice.
   const now = new Date();
   const outcome = await prisma.$transaction(async (tx) => {
     const spent = await tx.oAuthToken.updateMany({
       where: { id: token.id, rotatedAt: null },
       data: { rotatedAt: now },
     });
-    if (spent.count === 0) return "used" as const;
+    if (spent.count === 0 && !(await spentWithinGrace(tx, token.id, now))) return "used" as const;
     if (token.expiresAt <= now) return "expired" as const;
 
     // Housekeeping: expired tokens can never be used or replayed again.
@@ -205,6 +208,17 @@ async function refreshAccessToken(params: URLSearchParams): Promise<TokenResult>
     return refuse("invalid_grant", "The refresh token has expired");
   }
   return { ok: true, body: outcome };
+}
+
+/**
+ * Whether a refresh token was first spent at most REFRESH_REUSE_GRACE_SECONDS
+ * before `now`. The grace runs from that first use, so presenting the token
+ * again never extends it, and a token revoked since is gone, so never in it.
+ */
+async function spentWithinGrace(tx: Prisma.TransactionClient, id: string, now: Date) {
+  const token = await tx.oAuthToken.findUnique({ where: { id }, select: { rotatedAt: true } });
+  if (!token?.rotatedAt) return false;
+  return now.getTime() - token.rotatedAt.getTime() <= REFRESH_REUSE_GRACE_SECONDS * 1000;
 }
 
 export async function handleTokenRequest(params: URLSearchParams): Promise<TokenResult> {

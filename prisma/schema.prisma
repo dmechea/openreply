@@ -496,7 +496,8 @@ model OAuthToken {
   tokenHash    String         @unique
   expiresAt    DateTime
   /// Set once a refresh token has been exchanged for a new pair. Presenting
-  /// it again means it leaked, and revokes the whole connection.
+  /// it again means it leaked, and revokes the whole connection, unless it
+  /// comes back within REFRESH_REUSE_GRACE_SECONDS (lib/oauth/config.ts).
   rotatedAt    DateTime?
   /// The refresh token this one was issued in exchange for, if any.
   parentId     String?

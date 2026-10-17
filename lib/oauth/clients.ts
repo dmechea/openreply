@@ -85,6 +85,10 @@ const registrationSchema = z.object({
 
 const GRANT_TYPES = ["authorization_code", "refresh_token"];
 
+// The consent page shows the name inside its own sentences, where a character
+// that reverses or reorders text could make them read as something else.
+const BIDI_CONTROLS = /\p{Bidi_Control}/gu;
+
 export type RegistrationResult =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; error: string; description: string };
@@ -141,7 +145,7 @@ export async function registerClient(metadata: unknown): Promise<RegistrationRes
     }),
     prisma.oAuthClient.create({
       data: {
-        name: client_name?.trim() || "Unnamed app",
+        name: client_name?.replace(BIDI_CONTROLS, "").trim() || "Unnamed app",
         redirectUris: redirect_uris,
       },
     }),

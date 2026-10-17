@@ -1,4 +1,4 @@
-import { readBodyText } from "@/lib/oauth/body";
+import { closingConnection, readBodyText } from "@/lib/oauth/body";
 import { corsPreflight, oauthError, oauthJson } from "@/lib/oauth/http";
 import { handleTokenRequest } from "@/lib/oauth/tokens";
 
@@ -23,7 +23,9 @@ export async function POST(request: Request) {
   } catch {
     return oauthError("invalid_request", "The request body could not be read");
   }
-  if (text === null) return oauthError("invalid_request", "The request body is too large");
+  if (text === null) {
+    return closingConnection(oauthError("invalid_request", "The request body is too large"));
+  }
 
   const result = await handleTokenRequest(new URLSearchParams(text));
   if (!result.ok) return oauthError(result.error, result.description, result.status);
