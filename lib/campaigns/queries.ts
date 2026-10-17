@@ -1,6 +1,7 @@
 import type { Automation, TrackedLink } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
 import type { CreateCampaignInput } from "@/lib/campaigns/campaign";
+import { campaignTarget } from "@/lib/campaigns/target";
 import {
   calculateCtr,
   CLICK_ROW_SELECT,
@@ -10,19 +11,6 @@ import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
 import { buildTrackedUrl } from "@/lib/tracking/message";
 
 /** How campaigns read: their settings, target and how they are doing. */
-
-export type CampaignTarget =
-  | { type: "post"; postId: string | null; postUrl: string | null }
-  | { type: "any_post" }
-  | { type: "next_reel" };
-
-export function campaignTarget(
-  campaign: Pick<Automation, "pendingNextReel" | "matchAnyPost" | "postId" | "postUrl">
-): CampaignTarget {
-  if (campaign.pendingNextReel) return { type: "next_reel" };
-  if (campaign.matchAnyPost) return { type: "any_post" };
-  return { type: "post", postId: campaign.postId, postUrl: campaign.postUrl };
-}
 
 export type CampaignStats = {
   dmsSent: number;
@@ -101,20 +89,18 @@ function findCampaign(workspaceId: string, campaignId: string) {
   });
 }
 
-/** Every setting, in the field names create and update take, plus its stats. */
-export async function getCampaign(workspaceId: string, campaignId: string) {
-  const campaign = await findCampaign(workspaceId, campaignId);
-  if (!campaign) return null;
-  const [primary, secondary] = campaign.trackedLinks;
-  const stats = await campaignStats(workspaceId, [campaign.id]);
+type StoredCampaign = Automation & { trackedLinks: TrackedLink[] };
 
+/**
+ * The settings both reads give alike, in the field names create and update
+ * take. A link that is not set reads as null.
+ */
+function campaignSettings(campaign: StoredCampaign) {
+  const [primary, secondary]: (TrackedLink | undefined)[] = campaign.trackedLinks;
   return {
-    id: campaign.id,
-    instagramAccount: campaign.instagramAccount,
     name: campaign.name,
     goal: campaign.goal,
     isActive: campaign.isActive,
-    target: campaignTarget(campaign),
     keywords: campaign.keywords,
     matchAnyWord: campaign.matchAnyWord,
     wholeWordMatch: campaign.wholeWordMatch,
@@ -127,10 +113,6 @@ export async function getCampaign(workspaceId: string, campaignId: string) {
     trackedDestinationUrl: primary?.destinationUrl ?? null,
     secondaryDestinationUrl: secondary?.destinationUrl ?? null,
     secondaryButtonLabel: secondary?.label ?? null,
-    trackedLinks: campaign.trackedLinks.map((link) => ({
-      destinationUrl: link.destinationUrl,
-      trackedUrl: buildTrackedUrl(link.slug),
-    })),
     requireFollow: campaign.requireFollow,
     followPromptMessage: campaign.followPromptMessage,
     followPromptButtonLabel: campaign.followPromptButtonLabel,
@@ -139,6 +121,24 @@ export async function getCampaign(workspaceId: string, campaignId: string) {
     followUpDelayMinutes: campaign.followUpDelayMinutes,
     publicReplyEnabled: campaign.publicReplyEnabled,
     publicReplyMessages: campaign.publicReplyMessages,
+  };
+}
+
+/** Every setting, in the field names create and update take, plus its stats. */
+export async function getCampaign(workspaceId: string, campaignId: string) {
+  const campaign = await findCampaign(workspaceId, campaignId);
+  if (!campaign) return null;
+  const stats = await campaignStats(workspaceId, [campaign.id]);
+
+  return {
+    id: campaign.id,
+    instagramAccount: campaign.instagramAccount,
+    target: campaignTarget(campaign),
+    ...campaignSettings(campaign),
+    trackedLinks: campaign.trackedLinks.map((link) => ({
+      destinationUrl: link.destinationUrl,
+      trackedUrl: buildTrackedUrl(link.slug),
+    })),
     reportShareEnabled: campaign.reportShareEnabled,
     createdAt: campaign.createdAt.toISOString(),
     updatedAt: campaign.updatedAt.toISOString(),
@@ -156,37 +156,14 @@ export async function getCampaignAsCreateInput(
 ): Promise<Record<keyof CreateCampaignInput, unknown> | null> {
   const campaign = await findCampaign(workspaceId, campaignId);
   if (!campaign) return null;
-  const [primary, secondary]: (TrackedLink | undefined)[] = campaign.trackedLinks;
   return {
-    name: campaign.name,
-    goal: campaign.goal,
+    ...campaignSettings(campaign),
     instagramAccountId: campaign.instagramAccountId,
     postId: campaign.postId,
     postUrl: campaign.postUrl,
     pendingNextReel: campaign.pendingNextReel,
     matchAnyPost: campaign.matchAnyPost,
-    keywords: campaign.keywords,
-    matchAnyWord: campaign.matchAnyWord,
-    dmTriggerEnabled: campaign.dmTriggerEnabled,
-    dmMessage: campaign.dmMessage,
-    openingDmEnabled: campaign.openingDmEnabled,
-    openingDmMessage: campaign.openingDmMessage,
-    openingDmButtonLabel: campaign.openingDmButtonLabel,
-    linkButtonLabel: campaign.linkButtonLabel,
-    requireFollow: campaign.requireFollow,
-    followPromptMessage: campaign.followPromptMessage,
-    followPromptButtonLabel: campaign.followPromptButtonLabel,
-    followUpEnabled: campaign.followUpEnabled,
-    followUpMessage: campaign.followUpMessage,
-    followUpDelayMinutes: campaign.followUpDelayMinutes,
-    publicReplyEnabled: campaign.publicReplyEnabled,
     publicReplyMessage: campaign.publicReplyMessage,
-    publicReplyMessages: campaign.publicReplyMessages,
-    trackedDestinationUrl: primary?.destinationUrl ?? "",
-    secondaryDestinationUrl: secondary?.destinationUrl ?? "",
-    secondaryButtonLabel: secondary?.label ?? null,
-    isActive: campaign.isActive,
-    wholeWordMatch: campaign.wholeWordMatch,
   };
 }
 

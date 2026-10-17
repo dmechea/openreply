@@ -13,6 +13,7 @@ import {
   listCampaigns,
   listFailedDms,
 } from "@/lib/campaigns/queries";
+import { targetFlags } from "@/lib/campaigns/target";
 import {
   getConversation,
   listConversationsNeedingReply,
@@ -35,6 +36,8 @@ import { listWorkspaceInstagramAccounts, resolveInstagramAccount } from "@/lib/m
 
 /** A refusal the person should read, as opposed to a server fault. */
 class ToolRefusal extends Error {}
+
+const NO_SUCH_CAMPAIGN = "No campaign with that id in this workspace.";
 
 function ok(data: Record<string, unknown>): CallToolResult {
   return {
@@ -184,20 +187,15 @@ const updateInput = z
   })
   .strict();
 
-function targetFields(value: z.infer<typeof target>) {
-  switch (value.type) {
-    case "post":
-      return {
-        postId: value.postId,
-        postUrl: value.postUrl ?? null,
-        matchAnyPost: false,
-        pendingNextReel: false,
-      };
-    case "any_post":
-      return { matchAnyPost: true, pendingNextReel: false };
-    case "next_reel":
-      return { pendingNextReel: true, matchAnyPost: false };
-  }
+// Switching a campaign on or off, or its report link, cannot make it break a
+// create rule, so an edit of only these skips that check. A campaign stored
+// without those rules (the CSV import does not check postUrl) can still be
+// switched.
+const SWITCHES: ReadonlySet<string> = new Set(["isActive", "reportShareEnabled"]);
+
+function onlySwitches(changes: Record<string, unknown>) {
+  const keys = Object.keys(changes);
+  return keys.length > 0 && keys.every((key) => SWITCHES.has(key));
 }
 
 function withoutUndefined<T extends Record<string, unknown>>(value: T) {
@@ -246,6 +244,15 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
 
   const accountSummary = (a: { id: string; username: string }) => ({ id: a.id, username: a.username });
 
+  /** Runs a tool on the chosen account, its result headed by which account that was. */
+  async function forAccount<T extends Record<string, unknown>>(
+    identifier: string | undefined,
+    tool: (selected: Awaited<ReturnType<typeof account>>) => Promise<T>
+  ) {
+    const selected = await account(identifier);
+    return { account: accountSummary(selected), ...(await tool(selected)) };
+  }
+
   server.registerTool(
     "list_conversations_needing_reply",
     {
@@ -262,13 +269,11 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       annotations: READ_INSTAGRAM,
     },
     async (input) =>
-      run(async () => {
-        const selected = await account(input.instagramAccount);
-        return {
-          account: accountSummary(selected),
-          ...(await listConversationsNeedingReply(selected, { includeClosed: input.includeClosed })),
-        };
-      })
+      run(() =>
+        forAccount(input.instagramAccount, (selected) =>
+          listConversationsNeedingReply(selected, { includeClosed: input.includeClosed })
+        )
+      )
   );
 
   server.registerTool(
@@ -280,13 +285,11 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       annotations: READ_INSTAGRAM,
     },
     async (input) =>
-      run(async () => {
-        const selected = await account(input.instagramAccount);
-        return {
-          account: accountSummary(selected),
+      run(() =>
+        forAccount(input.instagramAccount, async (selected) => ({
           conversations: await listRecentConversations(selected),
-        };
-      })
+        }))
+      )
   );
 
   server.registerTool(
@@ -305,13 +308,9 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       annotations: READ_INSTAGRAM,
     },
     async (input) =>
-      run(async () => {
-        const selected = await account(input.instagramAccount);
-        return {
-          account: accountSummary(selected),
-          ...(await getConversation(selected, input.conversationId)),
-        };
-      })
+      run(() =>
+        forAccount(input.instagramAccount, (selected) => getConversation(selected, input.conversationId))
+      )
   );
 
   server.registerTool(
@@ -328,13 +327,11 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       annotations: READ_INSTAGRAM,
     },
     async (input) =>
-      run(async () => {
-        const selected = await account(input.instagramAccount);
-        return {
-          account: accountSummary(selected),
+      run(() =>
+        forAccount(input.instagramAccount, async (selected) => ({
           posts: await listRecentPosts(selected, input.limit ?? 25),
-        };
-      })
+        }))
+      )
   );
 
   server.registerTool(
@@ -346,13 +343,11 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       annotations: READ,
     },
     async (input) =>
-      run(async () => {
-        const selected = await account(input.instagramAccount);
-        return {
-          account: accountSummary(selected),
+      run(() =>
+        forAccount(input.instagramAccount, async (selected) => ({
           campaigns: await listCampaigns(workspaceId, selected.id),
-        };
-      })
+        }))
+      )
   );
 
   server.registerTool(
@@ -366,7 +361,7 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
     async (input) =>
       run(async () => {
         const campaign = await getCampaign(workspaceId, input.campaignId);
-        if (!campaign) throw new ToolRefusal("No campaign with that id in this workspace.");
+        if (!campaign) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
         return { campaign };
       })
   );
@@ -390,14 +385,12 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
         const limit = input.limit ?? 25;
         if (input.campaignId) {
           const campaign = await getCampaign(workspaceId, input.campaignId);
-          if (!campaign) throw new ToolRefusal("No campaign with that id in this workspace.");
+          if (!campaign) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
           return { failedDms: await listFailedDms(workspaceId, { campaignId: campaign.id }, limit) };
         }
-        const selected = await account(input.instagramAccount);
-        return {
-          account: accountSummary(selected),
+        return forAccount(input.instagramAccount, async (selected) => ({
           failedDms: await listFailedDms(workspaceId, { instagramAccountId: selected.id }, limit),
-        };
+        }));
       })
   );
 
@@ -417,7 +410,7 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
           const { target: chosen, ...rest } = input;
           const parsed = createCampaignSchema.safeParse({
             ...withoutUndefined(rest),
-            ...targetFields(chosen),
+            ...targetFlags(chosen),
             instagramAccountId: selected.id,
             isActive: false,
           });
@@ -432,7 +425,7 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       "update_campaign",
       {
         description:
-          "Change any of a campaign's settings, including switching it on (isActive true) or off (false). Only the fields given change. The campaign that would result must still follow the create rules, or nothing is changed and the reason is returned. Campaigns cannot be deleted from here.",
+          "Change any of a campaign's settings, including switching it on (isActive true) or off (false). Only the fields given change. An edit of only isActive and/or reportShareEnabled is never blocked by the campaign's other settings; an edit that changes anything else must leave a campaign that still follows the create rules, or nothing is changed and the reason is returned. Campaigns cannot be deleted from here.",
         inputSchema: updateInput,
         annotations: WRITE,
       },
@@ -441,12 +434,14 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
           const { campaignId, target: chosen, ...rest } = input;
           const changes = withoutUndefined({
             ...rest,
-            ...(chosen ? targetFields(chosen) : {}),
+            ...(chosen ? targetFlags(chosen) : {}),
           });
           const current = await getCampaignAsCreateInput(workspaceId, campaignId);
-          if (!current) throw new ToolRefusal("No campaign with that id in this workspace.");
-          const merged = createCampaignSchema.safeParse({ ...current, ...changes });
-          if (!merged.success) throw new ToolRefusal(describeIssues(merged.error));
+          if (!current) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
+          if (!onlySwitches(changes)) {
+            const merged = createCampaignSchema.safeParse({ ...current, ...changes });
+            if (!merged.success) throw new ToolRefusal(describeIssues(merged.error));
+          }
 
           const parsed = updateCampaignSchema.safeParse(changes);
           if (!parsed.success) throw new ToolRefusal(describeIssues(parsed.error));

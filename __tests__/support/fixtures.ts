@@ -5,6 +5,7 @@
 import { randomBytes } from "node:crypto";
 import type { PrismaClient, WorkspaceRole } from "@/app/generated/prisma/client";
 import { encryptToken } from "@/lib/meta/oauth";
+import { generateReportShareSlug } from "@/lib/reports/share";
 
 // Account tokens are stored encrypted, and the app decrypts them before every
 // Instagram call, so the suites need a key. Any 32-byte hex key will do.
@@ -70,4 +71,46 @@ export async function connectInstagramAccount(
     },
   });
   return { ...account, plainAccessToken: accessToken };
+}
+
+/**
+ * A campaign as the CSV import (app/api/automations/import) stores one. The
+ * import does not check that postUrl is a URL, so such a campaign can break
+ * rules a new campaign has to follow.
+ */
+export function importCampaign(
+  prisma: PrismaClient,
+  {
+    workspaceId,
+    instagramAccountId,
+    postId,
+    postUrl,
+    keyword = "GUIDE",
+    isActive = true,
+  }: {
+    workspaceId: string;
+    instagramAccountId: string;
+    postId: string;
+    postUrl: string | null;
+    keyword?: string;
+    isActive?: boolean;
+  }
+) {
+  return prisma.automation.create({
+    data: {
+      name: `Imported: ${keyword}`,
+      goal: null,
+      postId,
+      postUrl,
+      keywords: [keyword],
+      dmMessage: "Here is the guide",
+      publicReplyEnabled: false,
+      publicReplyMessage: null,
+      isActive,
+      wholeWordMatch: true,
+      workspaceId,
+      instagramAccountId,
+      reportShareSlug: generateReportShareSlug(),
+    },
+  });
 }

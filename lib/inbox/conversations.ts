@@ -6,6 +6,7 @@ import {
   getConversations,
   sendDirectMessage,
   type InstagramContext,
+  type ProviderAccount,
 } from "@/lib/instagram/provider";
 import type { InstagramMessage, InstagramParticipant } from "@/lib/meta/client";
 
@@ -16,10 +17,8 @@ import type { InstagramMessage, InstagramParticipant } from "@/lib/meta/client";
  * Whether it is a real inquiry is left to whoever reads it.
  */
 
-export type InboxAccount = Pick<
-  InstagramAccount,
-  "id" | "username" | "instagramId" | "provider" | "workspaceId" | "zernioAccountId" | "accessToken"
->;
+/** An account the inbox can be read for: what Instagram needs, plus who it is. */
+export type InboxAccount = ProviderAccount & Pick<InstagramAccount, "id" | "username">;
 
 /** Instagram allows a reply only within this long of the person's last message. */
 export const MESSAGING_WINDOW_HOURS = 24;

@@ -2,17 +2,20 @@
  * The MCP endpoint driven by a real MCP SDK client, over the OAuth tokens a
  * real handshake issues, against a real Postgres and an Instagram faked at
  * fetch: which tools each scope combination sees, what every tool does,
- * workspace isolation, and the 401s. Needs TEST_DATABASE_URL; see
- * docs/testing.md.
+ * workspace isolation, and the 401s for a missing, malformed, expired or
+ * revoked token. Needs TEST_DATABASE_URL; see docs/testing.md.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { hasTestDatabase, openTestDatabase, type TestDatabase } from "./support/database";
 import { signInAs } from "./support/session";
-import { connectInstagramAccount, createOwner } from "./support/fixtures";
+import { connectInstagramAccount, createOwner, importCampaign } from "./support/fixtures";
 import { createFakeInstagram, hoursAgo, type FakeInstagram } from "./support/instagram";
 import { ALL_SCOPES, BASE_URL, connect, MCP_URL } from "./support/oauth";
 
@@ -21,6 +24,8 @@ vi.mock("@/lib/auth", async () => (await import("./support/session")).authModule
 
 import { handleMcpRequest } from "../lib/mcp/handler";
 import { POST as dashboardCreate } from "../app/api/automations/route";
+import { createCampaignSchema } from "../lib/campaigns/campaign";
+import { getCampaignAsCreateInput } from "../lib/campaigns/queries";
 import { TRACKED_LINK_ORDER } from "../lib/tracking/link-order";
 
 const READ_TOOLS = [
@@ -48,14 +53,23 @@ let stranger = { id: "", workspaceId: "", accountId: "", campaignId: "" };
 const conversations: Record<string, string> = {};
 const clients: Client[] = [];
 
-async function mcpClient(accessToken: string) {
+type Answer = { status: number; challenge: string | null };
+
+/** A transport straight into the endpoint, noting each answer it gets back. */
+function transport(headers: Record<string, string>, answers: Answer[] = []) {
+  return new StreamableHTTPClientTransport(new URL(MCP_URL), {
+    fetch: async (url, init) => {
+      const response = await handleMcpRequest(new Request(url, init));
+      answers.push({ status: response.status, challenge: response.headers.get("www-authenticate") });
+      return response;
+    },
+    requestInit: { headers },
+  });
+}
+
+async function mcpClient(accessToken: string, answers?: Answer[]) {
   const client = new Client({ name: "test-client", version: "1.0.0" });
-  await client.connect(
-    new StreamableHTTPClientTransport(new URL(MCP_URL), {
-      fetch: (url, init) => handleMcpRequest(new Request(url, init)),
-      requestInit: { headers: { Authorization: `Bearer ${accessToken}` } },
-    })
-  );
+  await client.connect(transport({ Authorization: `Bearer ${accessToken}` }, answers));
   clients.push(client);
   return client;
 }
@@ -646,6 +660,57 @@ describe.skipIf(!hasTestDatabase)("the OpenReply MCP endpoint", () => {
       expect(errorText(opening)).toMatch(/Opening DM needs a message and a button label/);
     });
 
+    describe("an imported campaign that breaks today's create rules", () => {
+      // The CSV import stores a postUrl without checking it is a URL.
+      async function imported() {
+        const campaign = await importCampaign(db.prisma, {
+          workspaceId,
+          instagramAccountId: main.id,
+          postId: "media_imported",
+          postUrl: "instagram.com/p/imported",
+          isActive: false,
+        });
+        const asNew = createCampaignSchema.safeParse(await getCampaignAsCreateInput(workspaceId, campaign.id));
+        expect(asNew.error?.issues.map((issue) => issue.path.join("."))).toEqual(["postUrl"]);
+        return campaign;
+      }
+
+      const stored = (id: string) => db.prisma.automation.findUniqueOrThrow({ where: { id } });
+
+      it("can still be switched on and off, and its report link too", async () => {
+        const campaign = await imported();
+
+        const on = await data<{ campaign: Campaign }>(full, "update_campaign", {
+          campaignId: campaign.id,
+          isActive: true,
+        });
+        expect(on.campaign.isActive).toBe(true);
+        expect((await stored(campaign.id)).isActive).toBe(true);
+
+        const off = await data<{ campaign: Campaign }>(full, "update_campaign", {
+          campaignId: campaign.id,
+          isActive: false,
+        });
+        expect(off.campaign.isActive).toBe(false);
+        expect((await stored(campaign.id)).isActive).toBe(false);
+
+        await data(full, "update_campaign", { campaignId: campaign.id, reportShareEnabled: false });
+        expect((await stored(campaign.id)).reportShareEnabled).toBe(false);
+
+        await data(full, "update_campaign", { campaignId: campaign.id, isActive: true, reportShareEnabled: true });
+        expect(await stored(campaign.id)).toMatchObject({ isActive: true, reportShareEnabled: true });
+      });
+
+      it("refuses any other edit with the reason, changing nothing", async () => {
+        const campaign = await imported();
+        for (const edit of [{ name: "Renamed" }, { name: "Renamed", isActive: true }]) {
+          const result = await call(full, "update_campaign", { campaignId: campaign.id, ...edit });
+          expect(errorText(result)).toMatch(/postUrl/);
+          expect(await stored(campaign.id)).toEqual(campaign);
+        }
+      });
+    });
+
     it("reports a campaign's settings and stats", async () => {
       const campaign = await createViaMcp({
         ...minimalCampaign,
@@ -775,24 +840,78 @@ describe.skipIf(!hasTestDatabase)("the OpenReply MCP endpoint", () => {
   });
 
   describe("authentication", () => {
-    it("refuses a client with no token or a made-up one", async () => {
-      const attempts: Record<string, string>[] = [{}, { Authorization: "Bearer ora_made_up" }];
-      for (const headers of attempts) {
-        const client = new Client({ name: "intruder", version: "1.0.0" });
-        await expect(
-          client.connect(
-            new StreamableHTTPClientTransport(new URL(MCP_URL), {
-              fetch: (url, init) => handleMcpRequest(new Request(url, init)),
-              requestInit: { headers },
-            })
-          )
-        ).rejects.toThrow();
-      }
+    const REFUSED: Answer = {
+      status: 401,
+      challenge: expect.stringMatching(/^Bearer .*resource_metadata="/),
+    };
+
+    /** A client's attempt to connect sending these headers, and the endpoint's first answer. */
+    async function connectWith(headers: Record<string, string>) {
+      const answers: Answer[] = [];
+      const client = new Client({ name: "intruder", version: "1.0.0" });
+      const error = await client.connect(transport(headers, answers)).then(
+        () => {
+          clients.push(client);
+          return null;
+        },
+        (reason: unknown) => reason
+      );
+      return { error, answer: answers[0] };
+    }
+
+    function expectUnauthorized(error: unknown) {
+      expect(error).toBeInstanceOf(StreamableHTTPError);
+      expect((error as StreamableHTTPError).code).toBe(401);
+    }
+
+    it("lets in a client with a valid token", async () => {
+      const tokens = await connect({ userId: owner.id });
+      const { error, answer } = await connectWith({ Authorization: `Bearer ${tokens.access_token}` });
+      expect(error).toBeNull();
+      expect(answer).toEqual({ status: 200, challenge: null });
+    });
+
+    it.each<[string, Record<string, string>]>([
+      ["no token", {}],
+      ["Bearer and no token", { Authorization: "Bearer" }],
+      ["a made-up token", { Authorization: "Bearer ora_made_up" }],
+    ])("refuses a client with %s with a 401 and a challenge", async (_case, headers) => {
+      const { error, answer } = await connectWith(headers);
+      expectUnauthorized(error);
+      expect(answer).toEqual(REFUSED);
+    });
+
+    // A real token in a malformed header, so a lenient parser that dug it out
+    // anyway would be caught.
+    it.each<[string, (token: string) => string]>([
+      ["under the Basic scheme", (token) => `Basic ${token}`],
+      ["with more text after it", (token) => `Bearer ${token} extra`],
+      ["without a scheme", (token) => token],
+    ])("refuses a real token sent %s with a 401 and a challenge", async (_case, header) => {
+      const tokens = await connect({ userId: owner.id });
+      const { error, answer } = await connectWith({ Authorization: header(tokens.access_token) });
+      expectUnauthorized(error);
+      expect(answer).toEqual(REFUSED);
+    });
+
+    it("refuses an access token once it has expired", async () => {
+      const tokens = await connect({ userId: owner.id });
+      const headers = { Authorization: `Bearer ${tokens.access_token}` };
+      expect((await connectWith(headers)).answer.status).toBe(200);
+
+      await db.prisma.oAuthToken.updateMany({
+        where: { kind: "ACCESS", connection: { clientId: tokens.clientId } },
+        data: { expiresAt: new Date(Date.now() - 1000) },
+      });
+      const { error, answer } = await connectWith(headers);
+      expectUnauthorized(error);
+      expect(answer).toEqual(REFUSED);
     });
 
     it("stops a connected client on the request after its connection is revoked", async () => {
+      const answers: Answer[] = [];
       const tokens = await connect({ userId: owner.id });
-      const client = await mcpClient(tokens.access_token);
+      const client = await mcpClient(tokens.access_token, answers);
       await data(client, "list_campaigns");
       const connection = await db.prisma.oAuthConnection.findFirstOrThrow({
         where: { tokens: { some: {} }, clientId: tokens.clientId },
@@ -801,7 +920,13 @@ describe.skipIf(!hasTestDatabase)("the OpenReply MCP endpoint", () => {
         where: { id: connection.id },
         data: { revokedAt: new Date() },
       });
-      await expect(client.callTool({ name: "list_campaigns", arguments: {} })).rejects.toThrow();
+
+      const before = answers.length;
+      const error = await client
+        .callTool({ name: "list_campaigns", arguments: {} })
+        .then(() => null, (reason: unknown) => reason);
+      expectUnauthorized(error);
+      expect(answers.slice(before)).toEqual([REFUSED]);
     });
   });
 });
