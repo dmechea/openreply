@@ -16,18 +16,18 @@ export const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 export const REFRESH_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;
 export const AUTHORIZATION_CODE_TTL_SECONDS = 5 * 60;
 
-export function isScope(value: string): value is Scope {
-  return (SCOPES as readonly string[]).includes(value);
+/** The known scopes among `values`, in canonical order, unknown ones dropped. */
+export function knownScopes(values: readonly string[]): Scope[] {
+  return SCOPES.filter((scope) => values.includes(scope));
 }
 
 /** The scopes in a space-separated list, in canonical order, unknown ones dropped. */
 export function parseScopes(value: string | null | undefined): Scope[] {
-  const requested = new Set((value ?? "").split(/\s+/).filter(Boolean));
-  return SCOPES.filter((scope) => requested.has(scope));
+  return knownScopes((value ?? "").split(/\s+/));
 }
 
 export function formatScopes(scopes: readonly string[]): string {
-  return SCOPES.filter((scope) => scopes.includes(scope)).join(" ");
+  return knownScopes(scopes).join(" ");
 }
 
 export function issuer(): string {

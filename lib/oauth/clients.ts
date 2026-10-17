@@ -24,6 +24,10 @@ const FORBIDDEN_SCHEMES = new Set([
   "wss:",
 ]);
 
+function isLoopback(url: URL) {
+  return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
+}
+
 /**
  * Where an authorization code may be sent: an https URL, http only on a
  * loopback address (CLI clients such as Claude Code), or a native app's own
@@ -38,12 +42,8 @@ export function isAllowedRedirectUri(value: string): boolean {
   }
   if (url.hash || value.includes("#")) return false;
   if (url.protocol === "https:") return Boolean(url.hostname);
-  if (url.protocol === "http:") return LOOPBACK_HOSTS.has(url.hostname);
+  if (url.protocol === "http:") return isLoopback(url);
   return !FORBIDDEN_SCHEMES.has(url.protocol);
-}
-
-function isLoopback(url: URL) {
-  return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
 }
 
 /**

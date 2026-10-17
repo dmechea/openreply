@@ -28,7 +28,7 @@ failure instead of a skip, for example in a pre-push hook.
 
 ## What the suites fake
 
-Only two things:
+The suites built on the helpers in `__tests__/support/` fake only two things:
 
 - **Instagram**, at `fetch`, where `lib/meta/client.ts` reaches the Graph API
   (`__tests__/support/instagram.ts`). It keeps each account's conversations and
@@ -38,4 +38,8 @@ Only two things:
   The workspace-access rules built on it stay real.
 
 Everything else is real, including Postgres (`__tests__/support/database.ts`)
-and the seed helpers in `__tests__/support/fixtures.ts`.
+and the seed helpers in `__tests__/support/fixtures.ts`. The older
+`__tests__/tracked-link-order.db.test.ts` predates these helpers: it sets up
+its own schema and Prisma client instead of using
+`__tests__/support/database.ts`, and also fakes `@/lib/workspace-access`,
+treating every request as a workspace owner's.

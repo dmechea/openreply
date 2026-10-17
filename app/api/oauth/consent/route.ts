@@ -1,23 +1,19 @@
 import { NextResponse, type NextRequest } from "next/server";
 import {
   AUTHORIZATION_PARAMS,
+  AUTHORIZATION_PROBLEMS,
   authorizationResponseUrl,
   checkAuthorizationRequest,
   grantedScopes,
   issueAuthorizationCode,
+  signInUrl,
 } from "@/lib/oauth/authorization";
-import { issuer, OAUTH_PATHS } from "@/lib/oauth/config";
+import { issuer } from "@/lib/oauth/config";
+import { plainText, requestI18n } from "@/lib/oauth/browser";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
 } from "@/lib/workspace-access";
-
-function plainText(message: string, status: number) {
-  return new Response(message, {
-    status,
-    headers: { "Content-Type": "text/plain; charset=utf-8" },
-  });
-}
 
 // Only the consent page itself may submit an approval. The session cookie is
 // SameSite=Lax already; this also refuses a framed or cross-site form.
@@ -33,8 +29,9 @@ function isSameOriginForm(request: NextRequest) {
 // The consent page's form: approve or cancel an authorization request. The
 // request is checked again here, since the form fields came from the browser.
 export async function POST(request: NextRequest) {
+  const { t } = requestI18n(request);
   if (!isSameOriginForm(request)) {
-    return plainText("This approval must come from the OpenReply consent page.", 403);
+    return plainText(t("This approval must come from the OpenReply consent page."), 403);
   }
 
   const form = await request.formData();
@@ -46,8 +43,8 @@ export async function POST(request: NextRequest) {
 
   const check = await checkAuthorizationRequest(params);
   if (!check.ok) {
-    if (check.redirectTo) return NextResponse.redirect(check.redirectTo, 303);
-    return plainText(check.description, 400);
+    if (check.redirectTo !== null) return NextResponse.redirect(check.redirectTo, 303);
+    return plainText(t(AUTHORIZATION_PROBLEMS[check.problem]), 400);
   }
   const { redirectUri, state } = check.request;
 
@@ -63,13 +60,9 @@ export async function POST(request: NextRequest) {
   }
 
   const context = await getCurrentWorkspaceContext();
-  if (!context) {
-    const login = new URL("/login", issuer());
-    login.searchParams.set("callbackUrl", `${OAUTH_PATHS.authorize}?${params}`);
-    return NextResponse.redirect(login, 303);
-  }
+  if (!context) return NextResponse.redirect(signInUrl(params), 303);
   if (!canManageWorkspace(context.role)) {
-    return plainText("Only workspace owners and admins can connect apps.", 403);
+    return plainText(t("Only workspace owners and admins can connect apps."), 403);
   }
 
   const ticked = form.getAll("grant").filter((value) => typeof value === "string");

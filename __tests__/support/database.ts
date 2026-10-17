@@ -5,8 +5,8 @@
  * prisma/migrations exactly as `prisma migrate deploy` would build it, and
  * dropped when the suite ends, so it never touches existing data and suites
  * can run side by side against one server. Without TEST_DATABASE_URL these
- * suites skip; set REQUIRE_TEST_DATABASE=1 to make that an error instead, as
- * the pre-push gate does. See docs/testing.md.
+ * suites skip; set REQUIRE_TEST_DATABASE=1 to make that an error instead, for
+ * example in CI or a pre-push hook. See docs/testing.md.
  *
  * A suite routes the app's Prisma client here with:
  *

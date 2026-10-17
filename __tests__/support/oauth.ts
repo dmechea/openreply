@@ -77,8 +77,11 @@ export function authorizationParams({
   });
 }
 
-export function authorizeRequest(params: URLSearchParams) {
-  return authorize(new NextRequest(`${BASE_URL}/api/oauth/authorize?${params}`));
+export function authorizeRequest(
+  params: URLSearchParams,
+  headers: Record<string, string> = {}
+) {
+  return authorize(new NextRequest(`${BASE_URL}/api/oauth/authorize?${params}`, { headers }));
 }
 
 /** The consent page's form, submitted from the consent page itself. */

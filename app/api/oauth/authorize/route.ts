@@ -1,7 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getCurrentUserId } from "@/lib/auth";
-import { checkAuthorizationRequest } from "@/lib/oauth/authorization";
+import {
+  AUTHORIZATION_PROBLEMS,
+  checkAuthorizationRequest,
+  signInUrl,
+} from "@/lib/oauth/authorization";
 import { issuer, OAUTH_PATHS } from "@/lib/oauth/config";
+import { plainText, requestI18n } from "@/lib/oauth/browser";
 
 export const dynamic = "force-dynamic";
 
@@ -12,17 +17,13 @@ export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const check = await checkAuthorizationRequest(params);
   if (!check.ok) {
-    if (check.redirectTo) return NextResponse.redirect(check.redirectTo, 302);
-    return new Response(check.description, {
-      status: 400,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+    if (check.redirectTo !== null) return NextResponse.redirect(check.redirectTo, 302);
+    const { t } = requestI18n(request);
+    return plainText(t(AUTHORIZATION_PROBLEMS[check.problem]), 400);
   }
 
   if (!(await getCurrentUserId())) {
-    const login = new URL("/login", issuer());
-    login.searchParams.set("callbackUrl", `${OAUTH_PATHS.authorize}?${params}`);
-    return NextResponse.redirect(login, 302);
+    return NextResponse.redirect(signInUrl(params), 302);
   }
 
   return NextResponse.redirect(`${issuer()}${OAUTH_PATHS.consent}?${params}`, 302);

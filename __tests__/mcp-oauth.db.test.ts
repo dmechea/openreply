@@ -8,6 +8,9 @@
 import { createHash } from "node:crypto";
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { LOCALE_COOKIE } from "../lib/i18n";
+import ptBR from "../lib/i18n/pt-BR.json";
+import zhTW from "../lib/i18n/zh-TW.json";
 import { hasTestDatabase, openTestDatabase, type TestDatabase } from "./support/database";
 import { signInAs, signOut } from "./support/session";
 import { addMember, createOwner } from "./support/fixtures";
@@ -199,14 +202,28 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       signInAs(ownerId);
       const clientId = await registerClient();
       const { challenge } = pkce();
-      for (const params of [
-        authorizationParams({ clientId: "not-a-client", challenge }),
-        authorizationParams({ clientId, challenge, redirectUri: "https://evil.example/cb" }),
-      ]) {
+      for (const [params, message] of [
+        [
+          authorizationParams({ clientId: "not-a-client", challenge }),
+          "This app is not registered with OpenReply.",
+        ],
+        [
+          authorizationParams({ clientId, challenge, redirectUri: "https://evil.example/cb" }),
+          "The redirect URI does not match the one this app registered.",
+        ],
+      ] as const) {
         const res = await authorizeRequest(params);
         expect(res.status).toBe(400);
         expect(res.headers.get("location")).toBeNull();
+        expect(await res.text()).toBe(message);
       }
+    });
+
+    it("explains a request it cannot redirect in the person's interface language", async () => {
+      const params = authorizationParams({ clientId: "not-a-client", challenge: pkce().challenge });
+      const res = await authorizeRequest(params, { Cookie: `${LOCALE_COOKIE}=zh-TW` });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe(zhTW["This app is not registered with OpenReply."]);
     });
 
     it.each([
@@ -215,6 +232,8 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       ["no state", (p: URLSearchParams) => p.delete("state"), "invalid_request"],
       ["the implicit flow", (p: URLSearchParams) => p.set("response_type", "token"), "unsupported_response_type"],
       ["another server's resource", (p: URLSearchParams) => p.set("resource", "https://elsewhere.example/mcp"), "invalid_target"],
+      ["a scope OpenReply does not have", (p: URLSearchParams) => p.set("scope", "foo"), "invalid_scope"],
+      ["only scopes OpenReply does not have", (p: URLSearchParams) => p.set("scope", "foo bar"), "invalid_scope"],
     ])("sends the error back to the client for %s", async (_case, change, error) => {
       signInAs(ownerId);
       const clientId = await registerClient();
@@ -226,6 +245,7 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(location.origin + location.pathname).toBe(CLAUDE_REDIRECT);
       expect(location.searchParams.get("error")).toBe(error);
       expect(location.searchParams.get("state")).toBe(params.get("state") ? "keep-me" : null);
+      expect(location.searchParams.get("iss")).toBe(BASE_URL);
       expect(location.searchParams.get("code")).toBeNull();
     });
 
@@ -301,6 +321,37 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect((await res.json()).scope).toBe("read");
     });
 
+    it.each([
+      ["no scope", null, "read campaigns:write messages:send"],
+      ["an empty scope", "", "read campaigns:write messages:send"],
+      ["a known and an unknown scope", "messages:send foo", "read messages:send"],
+    ])("offers what the client asked for, always with read, given %s", async (_case, scope, granted) => {
+      signInAs(ownerId);
+      const clientId = await registerClient();
+      const { verifier, challenge } = pkce();
+      const params = authorizationParams({ clientId, challenge });
+      if (scope === null) params.delete("scope");
+      else params.set("scope", scope);
+      const code = codeFrom(await consentRequest(params, { grants: ALL_SCOPES }));
+      const res = await exchange(clientId, code, verifier);
+      expect((await res.json()).scope).toBe(granted);
+    });
+
+    it("re-checks the scopes, so a request for none OpenReply has goes back refused", async () => {
+      signInAs(ownerId);
+      const clientId = await registerClient();
+      const params = authorizationParams({ clientId, challenge: pkce().challenge, scope: "foo bar" });
+      const res = await consentRequest(params);
+      expect(res.status).toBe(303);
+      const location = new URL(res.headers.get("location")!);
+      expect(location.origin + location.pathname).toBe(CLAUDE_REDIRECT);
+      expect(location.searchParams.get("error")).toBe("invalid_scope");
+      expect(location.searchParams.get("state")).toBe("state-123");
+      expect(location.searchParams.get("iss")).toBe(BASE_URL);
+      expect(location.searchParams.get("code")).toBeNull();
+      expect(await db.prisma.oAuthAuthorizationCode.count({ where: { clientId } })).toBe(0);
+    });
+
     it("lets only someone who can manage the workspace consent", async () => {
       const member = await addMember(db.prisma, workspaceId, "MEMBER");
       signInAs(member.id);
@@ -308,6 +359,7 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       const params = authorizationParams({ clientId, challenge: pkce().challenge });
       const res = await consentRequest(params);
       expect(res.status).toBe(403);
+      expect(await res.text()).toBe("Only workspace owners and admins can connect apps.");
       expect(await db.prisma.oAuthAuthorizationCode.count({ where: { clientId } })).toBe(0);
 
       const admin = await addMember(db.prisma, workspaceId, "ADMIN");
@@ -336,6 +388,38 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
         expect((await consentRequest(params, { headers })).status).toBe(403);
       }
       expect(await db.prisma.oAuthAuthorizationCode.count({ where: { clientId } })).toBe(0);
+    });
+
+    it("answers a refusal in the person's interface language, English by default", async () => {
+      signInAs(ownerId);
+      const clientId = await registerClient();
+      const params = authorizationParams({ clientId, challenge: pkce().challenge });
+      const crossSite = { Origin: "https://evil.example", "Sec-Fetch-Site": "cross-site" };
+      const message = "This approval must come from the OpenReply consent page.";
+
+      const english = await consentRequest(params, { headers: crossSite });
+      expect(english.status).toBe(403);
+      expect(await english.text()).toBe(message);
+
+      const chinese = await consentRequest(params, {
+        headers: { ...crossSite, Cookie: `${LOCALE_COOKIE}=zh-TW` },
+      });
+      expect(chinese.status).toBe(403);
+      expect(await chinese.text()).toBe(zhTW[message]);
+
+      const edited = new URLSearchParams(params);
+      edited.set("redirect_uri", "https://evil.example/cb");
+      const mismatch = await consentRequest(edited, { headers: { Cookie: `${LOCALE_COOKIE}=zh-TW` } });
+      expect(mismatch.status).toBe(400);
+      expect(await mismatch.text()).toBe(
+        zhTW["The redirect URI does not match the one this app registered."]
+      );
+
+      const member = await addMember(db.prisma, workspaceId, "MEMBER");
+      signInAs(member.id);
+      const notAllowed = await consentRequest(params, { headers: { Cookie: `${LOCALE_COOKIE}=pt-BR` } });
+      expect(notAllowed.status).toBe(403);
+      expect(await notAllowed.text()).toBe(ptBR["Only workspace owners and admins can connect apps."]);
     });
 
     it("re-checks the request, so an edited redirect URI goes nowhere", async () => {

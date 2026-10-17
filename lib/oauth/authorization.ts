@@ -1,8 +1,10 @@
 import type { OAuthClient } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
+import type { StaticMessageKey } from "@/lib/i18n";
 import {
   AUTHORIZATION_CODE_TTL_SECONDS,
   issuer,
+  OAUTH_PATHS,
   parseScopes,
   SCOPES,
   type Scope,
@@ -37,13 +39,23 @@ export type AuthorizationRequest = {
   codeChallenge: string;
 };
 
+/** Why a request cannot even be answered at the client's redirect URI. */
+export type AuthorizationProblem = "unknown_client" | "redirect_mismatch";
+
+/** What the person is told about each problem, as English source copy for t(). */
+export const AUTHORIZATION_PROBLEMS: Record<AuthorizationProblem, StaticMessageKey> = {
+  unknown_client: "This app is not registered with OpenReply.",
+  redirect_mismatch: "The redirect URI does not match the one this app registered.",
+};
+
 export type AuthorizationCheck =
   | { ok: true; request: AuthorizationRequest }
-  // The client or its redirect URI cannot be trusted, so the error is shown
+  // The client or its redirect URI cannot be trusted, so the person is told
   // here and nobody is redirected anywhere (RFC 6749 §4.1.2.1).
-  | { ok: false; redirectTo: null; error: string; description: string }
-  // Anything else goes back to the client as an error response.
-  | { ok: false; redirectTo: string; error: string; description: string };
+  | { ok: false; redirectTo: null; problem: AuthorizationProblem }
+  // Anything else goes back to the client as an error response, whose
+  // description stays English: it is for the app, not the person.
+  | { ok: false; redirectTo: string };
 
 /** The client's redirect URI with an authorization response added to it. */
 export function authorizationResponseUrl(
@@ -59,6 +71,13 @@ export function authorizationResponseUrl(
   return url.toString();
 }
 
+/** The sign-in page, which brings the person back to this authorization request. */
+export function signInUrl(params: URLSearchParams): string {
+  const login = new URL("/login", issuer());
+  login.searchParams.set("callbackUrl", `${OAUTH_PATHS.authorize}?${params}`);
+  return login.toString();
+}
+
 function sameOrigin(value: string) {
   try {
     return new URL(value).origin === issuer();
@@ -71,14 +90,7 @@ export async function checkAuthorizationRequest(
   params: URLSearchParams
 ): Promise<AuthorizationCheck> {
   const client = await findClient(params.get("client_id"));
-  if (!client) {
-    return {
-      ok: false,
-      redirectTo: null,
-      error: "invalid_client",
-      description: "This app is not registered with OpenReply.",
-    };
-  }
+  if (!client) return { ok: false, redirectTo: null, problem: "unknown_client" };
 
   const requestedRedirect = params.get("redirect_uri");
   const redirectUri =
@@ -88,12 +100,7 @@ export async function checkAuthorizationRequest(
     !redirectUri ||
     !matchesRegisteredRedirectUri(client.redirectUris, redirectUri)
   ) {
-    return {
-      ok: false,
-      redirectTo: null,
-      error: "invalid_request",
-      description: "The redirect URI does not match the one this app registered.",
-    };
+    return { ok: false, redirectTo: null, problem: "redirect_mismatch" };
   }
 
   const state = params.get("state") ?? "";
@@ -104,8 +111,6 @@ export async function checkAuthorizationRequest(
       error_description: description,
       ...(state ? { state } : {}),
     }),
-    error,
-    description,
   });
 
   if (params.get("response_type") !== "code") {
@@ -123,9 +128,15 @@ export async function checkAuthorizationRequest(
     return refuse("invalid_target", "The resource is not served by this OpenReply");
   }
 
-  // Unknown scopes are ignored and `read` is always included. Asking for none
-  // offers everything, which is what the Claude app does.
-  const requested = parseScopes(params.get("scope"));
+  // Unknown scopes beside known ones are ignored, and `read` is always
+  // included. Asking for none offers everything, which is what the Claude app
+  // does; asking only for scopes OpenReply does not have is refused (RFC 6749
+  // §4.1.2.1).
+  const scope = params.get("scope")?.trim() ?? "";
+  const requested = parseScopes(scope);
+  if (scope && requested.length === 0) {
+    return refuse("invalid_scope", "None of the requested scopes is supported");
+  }
   const scopes = requested.length === 0 ? [...SCOPES] : requested;
   if (!scopes.includes("read")) scopes.unshift("read");
 

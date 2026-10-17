@@ -3,9 +3,11 @@ import { prisma } from "@/lib/db/client";
 import { getI18n } from "@/lib/i18n/server";
 import {
   AUTHORIZATION_PARAMS,
+  AUTHORIZATION_PROBLEMS,
   checkAuthorizationRequest,
+  signInUrl,
 } from "@/lib/oauth/authorization";
-import { OAUTH_PATHS, type Scope } from "@/lib/oauth/config";
+import type { Scope } from "@/lib/oauth/config";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -39,12 +41,10 @@ export default async function ConsentPage({
   }
 
   const check = await checkAuthorizationRequest(params);
-  if (!check.ok && check.redirectTo) redirect(check.redirectTo);
+  if (!check.ok && check.redirectTo !== null) redirect(check.redirectTo);
 
   const context = check.ok ? await getCurrentWorkspaceContext() : null;
-  if (check.ok && !context) {
-    redirect(`/login?callbackUrl=${encodeURIComponent(`${OAUTH_PATHS.authorize}?${params}`)}`);
-  }
+  if (check.ok && !context) redirect(signInUrl(params));
 
   const user = context
     ? await prisma.user.findUnique({
@@ -76,7 +76,9 @@ export default async function ConsentPage({
               <p role="alert" className="text-sm text-foreground">
                 {t("This connection request is not valid. Start again from the app you were connecting.")}
               </p>
-              {!check.ok && <p className="mt-3 text-xs text-muted">{check.description}</p>}
+              {!check.ok && (
+                <p className="mt-3 text-xs text-muted">{t(AUTHORIZATION_PROBLEMS[check.problem])}</p>
+              )}
             </>
           ) : (
             <>
@@ -84,8 +86,8 @@ export default async function ConsentPage({
                 {t("Connect {client} to OpenReply?", { client })}
               </h2>
               <p className="mt-2 text-sm text-muted">
-                {t("Signed in as {email}, workspace {workspace}.", {
-                  email: user?.email ?? user?.name ?? "",
+                {t("Signed in as {person}, workspace {workspace}.", {
+                  person: user?.email ?? user?.name ?? t("Unknown member"),
                   workspace: context.workspace.name,
                 })}
               </p>

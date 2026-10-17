@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/db/client";
-import { parseScopes, type Scope } from "@/lib/oauth/config";
+import { knownScopes, type Scope } from "@/lib/oauth/config";
 import { hashSecret } from "@/lib/oauth/secrets";
 import { canManageWorkspace } from "@/lib/workspace-access";
 
@@ -11,8 +11,6 @@ import { canManageWorkspace } from "@/lib/workspace-access";
  */
 
 export type McpCaller = {
-  connectionId: string;
-  userId: string;
   workspaceId: string;
   scopes: Scope[];
 };
@@ -73,10 +71,8 @@ export async function authenticateAccessToken(
   return {
     ok: true,
     caller: {
-      connectionId: connection.id,
-      userId: connection.userId,
       workspaceId: connection.workspaceId,
-      scopes: parseScopes(connection.scopes.join(" ")),
+      scopes: knownScopes(connection.scopes),
     },
   };
 }
@@ -117,7 +113,7 @@ export async function listWorkspaceConnections(workspaceId: string) {
   return connections.map((connection) => ({
     id: connection.id,
     clientName: connection.client.name,
-    scopes: parseScopes(connection.scopes.join(" ")),
+    scopes: knownScopes(connection.scopes),
     createdAt: connection.createdAt,
     lastUsedAt: connection.lastUsedAt,
     connectedBy: connection.user.name ?? connection.user.email,

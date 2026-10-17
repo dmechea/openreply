@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n/provider";
+import type { Scope } from "@/lib/oauth/config";
 
 interface Connection {
   id: string;
   clientName: string;
-  scopes: string[];
+  scopes: Scope[];
   createdAt: string;
   lastUsedAt: string | null;
   connectedBy: string | null;
@@ -38,7 +39,7 @@ export function ConnectedApps() {
     void load();
   }, []);
 
-  const scopeLabels: Record<string, string> = {
+  const scopeLabels: Record<Scope, string> = {
     read: t("Read"),
     "campaigns:write": t("Edit campaigns"),
     "messages:send": t("Send DMs"),
@@ -95,9 +96,9 @@ export function ConnectedApps() {
             <div className="min-w-0">
               <p className="truncate text-sm font-semibold text-foreground">{connection.clientName}</p>
               <p className="mt-1 text-xs text-muted">
-                {t("Connected {date} by {name}", {
+                {t("Connected {date} by {person}", {
                   date: new Date(connection.createdAt).toLocaleDateString(locale),
-                  name: connection.connectedBy ?? "—",
+                  person: connection.connectedBy ?? t("Unknown member"),
                 })}{" "}
                 ·{" "}
                 {connection.lastUsedAt
@@ -112,7 +113,7 @@ export function ConnectedApps() {
                     key={scope}
                     className="rounded-full border border-border px-2.5 py-0.5 text-xs font-medium text-muted"
                   >
-                    {scopeLabels[scope] ?? scope}
+                    {scopeLabels[scope]}
                   </span>
                 ))}
               </div>
