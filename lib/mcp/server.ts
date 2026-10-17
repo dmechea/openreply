@@ -2,27 +2,36 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
+  campaignEditAsBuilt,
+  describeCampaignIssues,
+  newCampaignAsBuilt,
+} from "@/lib/campaigns/builder-rules";
+import {
   createCampaign,
   createCampaignSchema,
+  editIssues,
   updateCampaign,
   updateCampaignSchema,
 } from "@/lib/campaigns/campaign";
 import {
   getCampaign,
-  getCampaignAsCreateInput,
+  getCampaignAccount,
+  getCampaignForEdit,
   listCampaigns,
   listFailedDms,
+  newCampaignDetails,
 } from "@/lib/campaigns/queries";
-import { targetFlags } from "@/lib/campaigns/target";
+import { campaignTarget, chosenTargetSchema, targetFlags } from "@/lib/campaigns/target";
 import {
   getConversation,
+  InboxRefusal,
   listConversationsNeedingReply,
   listRecentConversations,
   MESSAGING_WINDOW_HOURS,
   sendReply,
 } from "@/lib/inbox/conversations";
 import { MetaApiError, TokenExpiredError } from "@/lib/meta/client";
-import { listRecentPosts } from "@/lib/instagram/recent-posts";
+import { findAccountPost, listRecentPosts } from "@/lib/instagram/recent-posts";
 import { ZernioApiError } from "@/lib/zernio/client";
 import type { McpCaller } from "@/lib/oauth/connections";
 import { listWorkspaceInstagramAccounts, resolveInstagramAccount } from "@/lib/mcp/accounts";
@@ -59,7 +68,7 @@ async function run(operation: () => Promise<CallToolResult | Record<string, unkn
     const result = await operation();
     return "content" in result ? (result as CallToolResult) : ok(result);
   } catch (error) {
-    if (error instanceof ToolRefusal) return refused(error.message);
+    if (error instanceof ToolRefusal || error instanceof InboxRefusal) return refused(error.message);
     if (error instanceof TokenExpiredError) {
       return refused(
         "Instagram no longer accepts this account's login. Reconnect the account in OpenReply's Settings."
@@ -102,29 +111,15 @@ const instagramAccount = z
     "Which connected Instagram account to use, by username (with or without @) or id. Leave out for the main account."
   );
 
-const target = z
-  .discriminatedUnion("type", [
-    z.object({
-      type: z.literal("post"),
-      postId: z.string().min(1).describe("The post's or reel's id, from list_posts"),
-      postUrl: z
-        .string()
-        .url()
-        .optional()
-        .describe("Its permalink from list_posts, shown in the dashboard"),
-    }),
-    z.object({ type: z.literal("any_post") }),
-    z.object({ type: z.literal("next_reel") }),
-  ])
-  .describe(
-    "Which comments trigger the campaign: those on one post or reel (type post), on any post (type any_post), or on the next reel posted, which it attaches to once it is up (type next_reel)."
-  );
+const target = chosenTargetSchema.describe(
+  "Which comments trigger the campaign: those on one post or reel of the campaign's account (type post), on any post (type any_post), or on the next reel posted, which it attaches to once it is up (type next_reel). On an existing campaign, next_reel attaches to the first reel posted after the campaign was created, which can be a reel already up."
+);
 
-// Field rules come from the dashboard's own schemas, so both enforce the same
-// limits; only the descriptions are added here.
-const fields = updateCampaignSchema.shape;
+// Field rules come from the dashboard's own schemas, create's for
+// create_campaign and update's for update_campaign, so each tool enforces the
+// same limits as its dashboard counterpart; only the descriptions are added here.
 const FIELD_DESCRIPTIONS = {
-  name: "Campaign name, shown in the dashboard",
+  name: "Campaign name, shown in the dashboard; Campaign for @account when blank",
   goal: "Optional note on what the campaign is for",
   keywords:
     "Words that trigger the campaign when a comment contains one (up to 10). Ignored when matchAnyWord is true",
@@ -133,21 +128,21 @@ const FIELD_DESCRIPTIONS = {
     "Match keywords only as whole words (the default); false also matches them inside longer words",
   dmTriggerEnabled: "Also trigger when someone sends one of the keywords by DM",
   dmMessage:
-    "The private DM a commenter gets. {username} becomes their name. With a link set, the link arrives as a button under this text",
+    "The private DM a commenter gets. {username} becomes their name. With a link set, the link arrives as a button under this text, and {link}, where the link shows if the button cannot be sent, is added at the end unless the text has it",
   openingDmEnabled:
     "Send an opening DM with a button first; the DM with the link follows once they tap it",
   openingDmMessage: "The opening DM's text, required with openingDmEnabled",
   openingDmButtonLabel: "The opening DM's button label, required with openingDmEnabled",
-  linkButtonLabel: "Label of the link button (shown as Open link when empty)",
+  linkButtonLabel: "Label of the link button; Open link when blank",
   trackedDestinationUrl:
     "Where the link button goes; clicks are counted. An empty string removes the link",
   secondaryDestinationUrl:
-    "Where an optional second link button goes. An empty string removes it",
-  secondaryButtonLabel: "Label of the second link button",
+    "Where an optional second link button goes; it needs the first link. An empty string removes it",
+  secondaryButtonLabel: "Label of the second link button; Open link when blank",
   requireFollow:
     "Only send the link to people who follow the account; others get the follow prompt first",
   followPromptMessage: "The follow prompt's text, with requireFollow",
-  followPromptButtonLabel: "The follow prompt's button label, with requireFollow",
+  followPromptButtonLabel: "The follow prompt's button label, with requireFollow; i'm following when blank",
   followUpEnabled: "Send a follow-up message after the link is delivered",
   followUpMessage: "The follow-up's text, with followUpEnabled",
   followUpDelayMinutes: "Minutes to wait before the follow-up, 0 to 1440",
@@ -156,47 +151,40 @@ const FIELD_DESCRIPTIONS = {
     "Public reply texts (up to 10); one is picked for each comment so replies vary",
 } as const;
 
-const campaignFields = Object.fromEntries(
-  Object.entries(FIELD_DESCRIPTIONS).map(([key, description]) => [
-    key,
-    fields[key as keyof typeof FIELD_DESCRIPTIONS].describe(description),
-  ])
-) as { [K in keyof typeof FIELD_DESCRIPTIONS]: (typeof fields)[K] };
+type CampaignField = keyof typeof FIELD_DESCRIPTIONS;
+
+/** A schema's campaign fields, each with its description. */
+function describedFields<Shape extends Record<CampaignField, z.ZodType>>(shape: Shape) {
+  return Object.fromEntries(
+    Object.entries(FIELD_DESCRIPTIONS).map(([key, description]) => [
+      key,
+      shape[key as CampaignField].describe(description),
+    ])
+  ) as { [K in CampaignField]: Shape[K] };
+}
 
 const createInput = z
   .object({
     instagramAccount,
     target,
-    ...campaignFields,
-    name: campaignFields.name.unwrap().describe(FIELD_DESCRIPTIONS.name),
-    dmMessage: campaignFields.dmMessage.unwrap().describe(FIELD_DESCRIPTIONS.dmMessage),
+    ...describedFields(createCampaignSchema.shape),
   })
   .strict();
 
+const updateFields = updateCampaignSchema.shape;
 const updateInput = z
   .object({
     campaignId: z.string().min(1),
     target: target.optional(),
-    ...campaignFields,
-    isActive: fields.isActive.describe(
+    ...describedFields(updateFields),
+    isActive: updateFields.isActive.describe(
       "true switches the campaign on, so it starts sending DMs; false switches it off"
     ),
-    reportShareEnabled: fields.reportShareEnabled.describe(
+    reportShareEnabled: updateFields.reportShareEnabled.describe(
       "Whether the campaign's shareable report link works"
     ),
   })
   .strict();
-
-// Switching a campaign on or off, or its report link, cannot make it break a
-// create rule, so an edit of only these skips that check. A campaign stored
-// without those rules (the CSV import does not check postUrl) can still be
-// switched.
-const SWITCHES: ReadonlySet<string> = new Set(["isActive", "reportShareEnabled"]);
-
-function onlySwitches(changes: Record<string, unknown>) {
-  const keys = Object.keys(changes);
-  return keys.length > 0 && keys.every((key) => SWITCHES.has(key));
-}
 
 function withoutUndefined<T extends Record<string, unknown>>(value: T) {
   return Object.fromEntries(
@@ -204,30 +192,37 @@ function withoutUndefined<T extends Record<string, unknown>>(value: T) {
   ) as Partial<T>;
 }
 
-/** Zod's issues as one sentence per field, for the person to correct. */
-function describeIssues(error: z.ZodError) {
-  return error.issues
-    .map((issue) => (issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message))
-    .join("; ");
+/** What the connection is told when it connects, naming only the tools its scopes give it. */
+async function serverInstructions({ workspaceId, scopes }: McpCaller) {
+  const accounts = await listWorkspaceInstagramAccounts(workspaceId);
+  return [
+    "OpenReply runs Instagram comment-to-DM campaigns and reads the Instagram DM inbox.",
+    accounts.length
+      ? `Connected Instagram accounts: ${accounts.map((a, i) => `@${a.username}${i === 0 ? " (main)" : ""}`).join(", ")}. Tools use the main account unless told otherwise.`
+      : "No Instagram account is connected yet.",
+    `Instagram only allows a reply within ${MESSAGING_WINDOW_HOURS} hours of the person's last message.`,
+    ...(scopes.includes("messages:send")
+      ? ["Before send_reply, show the person the exact reply and send it only once they approve it."]
+      : []),
+    ...(scopes.includes("campaigns:write")
+      ? ["New campaigns start switched off: read the settings back and switch one on only when the person says so."]
+      : []),
+  ].join(" ");
 }
 
-export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
+/**
+ * `initializing` says whether the request is the client's initialize. Only
+ * the answer to it carries the instructions, so only then are they built.
+ */
+export async function createMcpServer(
+  caller: McpCaller,
+  { initializing }: { initializing: boolean }
+): Promise<McpServer> {
   const { workspaceId, scopes } = caller;
-  const accounts = await listWorkspaceInstagramAccounts(workspaceId);
 
   const server = new McpServer(
     { name: "openreply", version: "1.0.0" },
-    {
-      instructions: [
-        "OpenReply runs Instagram comment-to-DM campaigns and reads the Instagram DM inbox.",
-        accounts.length
-          ? `Connected Instagram accounts: ${accounts.map((a, i) => `@${a.username}${i === 0 ? " (main)" : ""}`).join(", ")}. Tools use the main account unless told otherwise.`
-          : "No Instagram account is connected yet.",
-        `Instagram only allows a reply within ${MESSAGING_WINDOW_HOURS} hours of the person's last message.`,
-        "Before send_reply, show the person the exact reply and send it only once they approve it.",
-        "New campaigns start switched off: read the settings back and switch one on only when the person says so.",
-      ].join(" "),
-    }
+    initializing ? { instructions: await serverInstructions(caller) } : {}
   );
 
   async function account(identifier?: string) {
@@ -253,10 +248,37 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
     return { account: accountSummary(selected), ...(await tool(selected)) };
   }
 
+  /**
+   * A campaign's target post, checked with Instagram to be one of the
+   * campaign's account's own posts: a campaign on another account's post
+   * would never trigger. Nothing is saved unchecked.
+   */
+  async function accountPost(selected: Awaited<ReturnType<typeof account>>, postId: string) {
+    let post: Awaited<ReturnType<typeof findAccountPost>>;
+    try {
+      post = await findAccountPost(selected, postId);
+    } catch (error) {
+      if (error instanceof TokenExpiredError) throw error;
+      const reason =
+        error instanceof MetaApiError
+          ? `Instagram refused the request (${error.message})`
+          : "Instagram could not be reached";
+      throw new ToolRefusal(
+        `${reason}, so the target post could not be checked and nothing was saved. Try again in a moment.`
+      );
+    }
+    if (!post) {
+      throw new ToolRefusal(
+        `target.postId: ${postId} is not a post or reel of @${selected.username}. Use an id from list_posts for that account.`
+      );
+    }
+    return post;
+  }
+
   server.registerTool(
     "list_conversations_needing_reply",
     {
-      description: `DM conversations waiting for a reply: those whose last message is from the other person. Each has the contact, a preview and time of their last message, and how many hours are left in Instagram's ${MESSAGING_WINDOW_HOURS}-hour reply window, soonest to close first. Closed windows are left out unless includeClosed is true; closedWindowCount says how many. Read live from Instagram's 50 most recent conversations. Whether a conversation is a real inquiry or just a thank-you is for you to judge.`,
+      description: `DM conversations waiting for a reply: those whose last message is from the other person. Each has the contact, a preview and time of their last message, and how many hours are left in Instagram's ${MESSAGING_WINDOW_HOURS}-hour reply window, soonest to close first. Closed windows are left out unless includeClosed is true; closedWindowCount says how many. Without includeClosed, conversations quiet for over ${MESSAGING_WINDOW_HOURS} hours whose last message Instagram's list leaves out are not opened, as they can no longer be replied to; uncheckedCount says how many. Read live from Instagram's 50 most recent conversations. Whether a conversation is a real inquiry or just a thank-you is for you to judge.`,
       inputSchema: z
         .object({
           instagramAccount,
@@ -295,7 +317,7 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
   server.registerTool(
     "get_conversation",
     {
-      description: `One DM conversation's messages, oldest to newest (Instagram returns the 20 most recent), each from "me" or "them" with its time and text. Messages without text, such as story replies, reactions and attachments, show as a placeholder. window says whether a reply can still be sent and until when.`,
+      description: `One DM conversation's messages, oldest to newest (Instagram returns the 20 most recent), each from "me" or "them" with its time and text. Messages without text, such as story replies, reactions and attachments, show as a placeholder. window says whether a reply can still be sent and until when; open is null when the messages returned are all mine and recent, so the person's last message is older than them and the window cannot be told. Use the instagramAccount the conversation was listed with: another account's conversation is refused.`,
       inputSchema: z
         .object({
           conversationId: z
@@ -384,9 +406,21 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       run(async () => {
         const limit = input.limit ?? 25;
         if (input.campaignId) {
-          const campaign = await getCampaign(workspaceId, input.campaignId);
-          if (!campaign) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
-          return { failedDms: await listFailedDms(workspaceId, { campaignId: campaign.id }, limit) };
+          const campaignAccount = await getCampaignAccount(workspaceId, input.campaignId);
+          if (!campaignAccount) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
+          // A campaign belongs to one account; an account named with it must be that one.
+          if (input.instagramAccount) {
+            const named = await account(input.instagramAccount);
+            if (named.id !== campaignAccount.id) {
+              throw new ToolRefusal(
+                `That campaign is on @${campaignAccount.username}, not @${named.username}.`
+              );
+            }
+          }
+          return {
+            account: accountSummary(campaignAccount),
+            failedDms: await listFailedDms(workspaceId, { campaignId: input.campaignId }, limit),
+          };
         }
         return forAccount(input.instagramAccount, async (selected) => ({
           failedDms: await listFailedDms(workspaceId, { instagramAccountId: selected.id }, limit),
@@ -408,16 +442,22 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
           const selected = await account(input.instagramAccount);
           // The create schema drops keys it does not know, such as instagramAccount.
           const { target: chosen, ...rest } = input;
+          const built = newCampaignAsBuilt(withoutUndefined(rest), selected.username);
+          if (!built.ok) throw new ToolRefusal(built.message);
           const parsed = createCampaignSchema.safeParse({
-            ...withoutUndefined(rest),
+            ...built.fields,
             ...targetFlags(chosen),
             instagramAccountId: selected.id,
             isActive: false,
           });
-          if (!parsed.success) throw new ToolRefusal(describeIssues(parsed.error));
+          if (!parsed.success) throw new ToolRefusal(describeCampaignIssues(parsed.error.issues));
+          if (chosen.type === "post") {
+            const post = await accountPost(selected, chosen.postId);
+            parsed.data.postUrl = chosen.postUrl ?? post.permalink;
+          }
           const created = await createCampaign(workspaceId, parsed.data);
           if (!created.ok) throw new ToolRefusal(created.message);
-          return { campaign: await getCampaign(workspaceId, created.campaign.id) };
+          return { campaign: newCampaignDetails(created.campaign, accountSummary(selected)) };
         })
     );
 
@@ -425,27 +465,43 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
       "update_campaign",
       {
         description:
-          "Change any of a campaign's settings, including switching it on (isActive true) or off (false). Only the fields given change. An edit of only isActive and/or reportShareEnabled is never blocked by the campaign's other settings; an edit that changes anything else must leave a campaign that still follows the create rules, or nothing is changed and the reason is returned. Campaigns cannot be deleted from here.",
+          "Change any of a campaign's settings, including switching it on (isActive true) or off (false). Only the fields given change. An edit that would break a create rule is refused with the reason and nothing is changed; a rule the campaign already breaks (such as an imported campaign's bad post link) does not block an edit that leaves it alone. If the campaign is saved elsewhere meanwhile, nothing is changed: read it again and retry. Campaigns cannot be deleted from here.",
         inputSchema: updateInput,
         annotations: WRITE,
       },
       async (input) =>
         run(async () => {
           const { campaignId, target: chosen, ...rest } = input;
-          const changes = withoutUndefined({
-            ...rest,
-            ...(chosen ? targetFlags(chosen) : {}),
-          });
-          const current = await getCampaignAsCreateInput(workspaceId, campaignId);
-          if (!current) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
-          if (!onlySwitches(changes)) {
-            const merged = createCampaignSchema.safeParse({ ...current, ...changes });
-            if (!merged.success) throw new ToolRefusal(describeIssues(merged.error));
+          const stored = await getCampaignForEdit(workspaceId, campaignId);
+          if (!stored) throw new ToolRefusal(NO_SUCH_CAMPAIGN);
+          const built = campaignEditAsBuilt(
+            withoutUndefined({ ...rest, ...(chosen ? targetFlags(chosen) : {}) }),
+            stored.settings,
+            stored.instagramAccount.username
+          );
+          if (!built.ok) throw new ToolRefusal(built.message);
+
+          const parsed = updateCampaignSchema.safeParse(built.fields);
+          if (!parsed.success) throw new ToolRefusal(describeCampaignIssues(parsed.error.issues));
+          const broken = editIssues(stored.settings, parsed.data);
+          if (broken.length > 0) throw new ToolRefusal(describeCampaignIssues(broken));
+          if (chosen?.type === "post") {
+            const current = campaignTarget(stored.settings);
+            if (current.type === "post" && current.postId === chosen.postId) {
+              // The post the campaign is already on is not looked up again: it
+              // may since have dropped out of the recent posts the lookup reads.
+              parsed.data.postUrl = chosen.postUrl ?? current.postUrl;
+            } else {
+              const post = await accountPost(await account(stored.instagramAccount.id), chosen.postId);
+              parsed.data.postUrl = chosen.postUrl ?? post.permalink;
+            }
           }
 
-          const parsed = updateCampaignSchema.safeParse(changes);
-          if (!parsed.success) throw new ToolRefusal(describeIssues(parsed.error));
-          const updated = await updateCampaign(workspaceId, campaignId, parsed.data);
+          // Written only if nothing saved the campaign since it was read, so
+          // the checks above still hold.
+          const updated = await updateCampaign(workspaceId, campaignId, parsed.data, {
+            unchangedSince: stored.updatedAt,
+          });
           if (!updated.ok) throw new ToolRefusal(updated.message);
           return { campaign: await getCampaign(workspaceId, campaignId) };
         })
@@ -456,7 +512,7 @@ export async function createMcpServer(caller: McpCaller): Promise<McpServer> {
     server.registerTool(
       "send_reply",
       {
-        description: `Send a text DM into an existing conversation, from the account. Always show the person the exact text and send only after they approve it. The ${MESSAGING_WINDOW_HOURS}-hour window is checked again first: if it has closed nothing is sent and status is window_closed. If Instagram refuses, status is rejected with its reason. If the outcome is unknown, status is unconfirmed: it may or may not have arrived, so check the conversation with get_conversation before ever sending again. Never retried automatically.`,
+        description: `Send a text DM into an existing conversation, from the account. Always show the person the exact text and send only after they approve it. The ${MESSAGING_WINDOW_HOURS}-hour window is checked again first: if it has closed nothing is sent and status is window_closed. When the conversation cannot show the window, Instagram decides. Use the instagramAccount the conversation was listed with. If Instagram refuses, status is rejected with its reason. If the outcome is unknown, status is unconfirmed: it may or may not have arrived, so check the conversation with get_conversation before ever sending again. Never retried automatically.`,
         inputSchema: z
           .object({
             conversationId: z.string().min(1),

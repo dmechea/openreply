@@ -18,8 +18,8 @@ import { generateSecret, hashSecret, isS256Challenge } from "@/lib/oauth/secrets
  * produces.
  */
 
-/** The parameters of an authorization request that the consent form carries. */
-export const AUTHORIZATION_PARAMS = [
+/** The parameters of an authorization request; no other is read or passed on. */
+const AUTHORIZATION_PARAMS = [
   "response_type",
   "client_id",
   "redirect_uri",
@@ -29,6 +29,26 @@ export const AUTHORIZATION_PARAMS = [
   "code_challenge_method",
   "resource",
 ] as const;
+
+type AuthorizationParam = (typeof AUTHORIZATION_PARAMS)[number];
+
+/**
+ * An authorization request's parameters, from wherever it arrived: the
+ * authorize URL, the consent page's query or the consent form. Anything else
+ * is left behind, and a parameter given twice counts by its first value, so
+ * all three see the same request.
+ */
+export function readAuthorizationParams(
+  read: (name: AuthorizationParam) => unknown
+): URLSearchParams {
+  const params = new URLSearchParams();
+  for (const name of AUTHORIZATION_PARAMS) {
+    const given = read(name);
+    const value = Array.isArray(given) ? given[0] : given;
+    if (typeof value === "string") params.set(name, value);
+  }
+  return params;
+}
 
 export type AuthorizationRequest = {
   client: OAuthClient;
@@ -86,13 +106,18 @@ function sameOrigin(value: string) {
   }
 }
 
+/** Checks an authorization request, as readAuthorizationParams reads it. */
 export async function checkAuthorizationRequest(
   params: URLSearchParams
 ): Promise<AuthorizationCheck> {
-  const client = await findClient(params.get("client_id"));
+  // Every read goes through the list, so a new parameter has to join it and
+  // the consent page and form carry it too.
+  const param = (name: AuthorizationParam) => params.get(name);
+
+  const client = await findClient(param("client_id"));
   if (!client) return { ok: false, redirectTo: null, problem: "unknown_client" };
 
-  const requestedRedirect = params.get("redirect_uri");
+  const requestedRedirect = param("redirect_uri");
   const redirectUri =
     requestedRedirect ??
     (client.redirectUris.length === 1 ? client.redirectUris[0] : null);
@@ -103,7 +128,7 @@ export async function checkAuthorizationRequest(
     return { ok: false, redirectTo: null, problem: "redirect_mismatch" };
   }
 
-  const state = params.get("state") ?? "";
+  const state = param("state") ?? "";
   const refuse = (error: string, description: string): AuthorizationCheck => ({
     ok: false,
     redirectTo: authorizationResponseUrl(redirectUri, {
@@ -113,17 +138,17 @@ export async function checkAuthorizationRequest(
     }),
   });
 
-  if (params.get("response_type") !== "code") {
+  if (param("response_type") !== "code") {
     return refuse("unsupported_response_type", "Only response_type=code is supported");
   }
   if (!state || state.length > 2048) {
     return refuse("invalid_request", "A state parameter is required");
   }
-  const codeChallenge = params.get("code_challenge") ?? "";
-  if (params.get("code_challenge_method") !== "S256" || !isS256Challenge(codeChallenge)) {
+  const codeChallenge = param("code_challenge") ?? "";
+  if (param("code_challenge_method") !== "S256" || !isS256Challenge(codeChallenge)) {
     return refuse("invalid_request", "PKCE with code_challenge_method=S256 is required");
   }
-  const resource = params.get("resource");
+  const resource = param("resource");
   if (resource !== null && !sameOrigin(resource)) {
     return refuse("invalid_target", "The resource is not served by this OpenReply");
   }
@@ -132,7 +157,7 @@ export async function checkAuthorizationRequest(
   // included. Asking for none offers everything, which is what the Claude app
   // does; asking only for scopes OpenReply does not have is refused (RFC 6749
   // §4.1.2.1).
-  const scope = params.get("scope")?.trim() ?? "";
+  const scope = param("scope")?.trim() ?? "";
   const requested = parseScopes(scope);
   if (scope && requested.length === 0) {
     return refuse("invalid_scope", "None of the requested scopes is supported");

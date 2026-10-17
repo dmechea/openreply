@@ -16,12 +16,38 @@ export type McpCaller = {
 };
 
 export type AccessCheck =
-  | { ok: true; caller: McpCaller }
+  | {
+      ok: true;
+      caller: McpCaller;
+      /**
+       * Notes the connection's use for Settings. The endpoint runs it only
+       * for a request it goes on to serve, alongside that request's own work
+       * rather than before it.
+       */
+      recordUse: () => Promise<void>;
+    }
   | { ok: false; reason: "missing" | "invalid" };
 
 // lastUsedAt is for people reading Settings, so minute precision is plenty
 // and spares a write on every request.
 const LAST_USED_RESOLUTION_MS = 60_000;
+
+/** Whether the person who approved a connection can still manage its workspace. */
+export async function approverCanManage(connection: {
+  workspaceId: string;
+  userId: string;
+}): Promise<boolean> {
+  const membership = await prisma.workspaceMember.findUnique({
+    where: {
+      workspaceId_userId: {
+        workspaceId: connection.workspaceId,
+        userId: connection.userId,
+      },
+    },
+    select: { role: true },
+  });
+  return Boolean(membership && canManageWorkspace(membership.role));
+}
 
 export async function authenticateAccessToken(
   authorization: string | null
@@ -45,27 +71,8 @@ export async function authenticateAccessToken(
   }
 
   const { connection } = token;
-  const membership = await prisma.workspaceMember.findUnique({
-    where: {
-      workspaceId_userId: {
-        workspaceId: connection.workspaceId,
-        userId: connection.userId,
-      },
-    },
-    select: { role: true },
-  });
-  if (!membership || !canManageWorkspace(membership.role)) {
+  if (!(await approverCanManage(connection))) {
     return { ok: false, reason: "invalid" };
-  }
-
-  if (
-    !connection.lastUsedAt ||
-    now.getTime() - connection.lastUsedAt.getTime() > LAST_USED_RESOLUTION_MS
-  ) {
-    await prisma.oAuthConnection.update({
-      where: { id: connection.id },
-      data: { lastUsedAt: now },
-    });
   }
 
   return {
@@ -74,7 +81,21 @@ export async function authenticateAccessToken(
       workspaceId: connection.workspaceId,
       scopes: knownScopes(connection.scopes),
     },
+    recordUse: () => recordUse(connection, now),
   };
+}
+
+async function recordUse(connection: { id: string; lastUsedAt: Date | null }, now: Date) {
+  if (
+    connection.lastUsedAt &&
+    now.getTime() - connection.lastUsedAt.getTime() <= LAST_USED_RESOLUTION_MS
+  ) {
+    return;
+  }
+  await prisma.oAuthConnection.update({
+    where: { id: connection.id },
+    data: { lastUsedAt: now },
+  });
 }
 
 /** Revoke a connection and discard its tokens. */

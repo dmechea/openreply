@@ -6,7 +6,10 @@
  * Needs TEST_DATABASE_URL; see docs/testing.md.
  */
 import { createHash } from "node:crypto";
+import { getURLFromRedirectError } from "next/dist/client/components/redirect";
+import { isRedirectError } from "next/dist/client/components/redirect-error";
 import { NextRequest } from "next/server";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCALE_COOKIE } from "../lib/i18n";
 import ptBR from "../lib/i18n/pt-BR.json";
@@ -34,6 +37,14 @@ import {
 
 vi.mock("@/lib/db/client", async () => (await import("./support/database")).prismaModule);
 vi.mock("@/lib/auth", async () => (await import("./support/session")).authModule);
+// The consent page and the refusals a browser sees read the interface
+// language from the request's cookies through next/headers. A test chooses
+// the language with useLocale; without it they answer in English.
+const cookieStore = vi.hoisted(() => ({ get: vi.fn() }));
+vi.mock("next/headers", () => ({
+  cookies: async () => cookieStore,
+  headers: async () => new Headers(),
+}));
 
 import { GET as rootResourceMetadata } from "../app/.well-known/oauth-protected-resource/route";
 import { GET as resourceMetadata } from "../app/.well-known/oauth-protected-resource/api/mcp/route";
@@ -42,12 +53,83 @@ import {
   DELETE as revokeConnection,
   GET as listConnections,
 } from "../app/api/oauth/connections/route";
+import { POST as registerRoute } from "../app/api/oauth/register/route";
+import { POST as tokenRoute } from "../app/api/oauth/token/route";
+import ConsentPage from "../app/oauth/consent/page";
 
 let db: TestDatabase;
 let ownerId = "";
 let workspaceId = "";
 
 const RESOURCE_METADATA_URL = `${BASE_URL}/.well-known/oauth-protected-resource/api/mcp`;
+
+function hashOf(secret: string) {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+/** Makes the next requests carry this interface language's cookie. */
+function useLocale(locale: string) {
+  cookieStore.get.mockImplementation((name: string) =>
+    name === LOCALE_COOKIE ? { name, value: locale } : undefined
+  );
+}
+
+/** The query as Next hands it to a page, where a repeated parameter becomes a list. */
+function searchParamsOf(params: URLSearchParams) {
+  const query: Record<string, string | string[]> = {};
+  for (const [name, value] of params) {
+    const seen = query[name];
+    query[name] = seen === undefined ? value : [seen, value].flat();
+  }
+  return query;
+}
+
+/** The consent page for these parameters: where it redirects, or what it shows. */
+async function consentPage(params: URLSearchParams) {
+  let page: Awaited<ReturnType<typeof ConsentPage>>;
+  try {
+    page = await ConsentPage({ searchParams: Promise.resolve(searchParamsOf(params)) });
+  } catch (error) {
+    if (!isRedirectError(error)) throw error;
+    return { location: getURLFromRedirectError(error), html: null };
+  }
+  return { location: null, html: renderToStaticMarkup(page) };
+}
+
+/**
+ * A request body of `size` bytes, streamed a kilobyte at a time, that counts
+ * how much of it the route pulled.
+ */
+function streamedBody(size: number) {
+  const chunk = new TextEncoder().encode("a".repeat(1024));
+  const pulled = { bytes: 0 };
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled.bytes >= size) return controller.close();
+      pulled.bytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
+  return { body, pulled };
+}
+
+/** A POST whose body is streamed, with or without a declared Content-Length. */
+function streamedPost(
+  path: string,
+  contentType: string,
+  body: ReadableStream<Uint8Array>,
+  contentLength?: number
+) {
+  return new Request(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": contentType,
+      ...(contentLength === undefined ? {} : { "Content-Length": String(contentLength) }),
+    },
+    body,
+    duplex: "half",
+  } as RequestInit);
+}
 
 function exchange(clientId: string, code: string, verifier: string, redirectUri = CLAUDE_REDIRECT) {
   return tokenRequest({
@@ -89,6 +171,7 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
 
   beforeEach(() => {
     signOut();
+    cookieStore.get.mockReset();
   });
 
   describe("discovery", () => {
@@ -176,6 +259,45 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
         expect((await registerRequest({ redirect_uris: [uri] })).status).toBe(201);
       }
     });
+
+    it("refuses an oversized registration without reading all of it", async () => {
+      const declared = streamedBody(5_000_000);
+      const res = await registerRoute(
+        streamedPost("/api/oauth/register", "application/json", declared.body, 5_000_000)
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("invalid_client_metadata");
+      expect(declared.pulled.bytes).toBeLessThan(10_000);
+
+      const undeclared = streamedBody(5_000_000);
+      const chunked = await registerRoute(
+        streamedPost("/api/oauth/register", "application/json", undeclared.body)
+      );
+      expect(chunked.status).toBe(400);
+      expect((await chunked.json()).error).toBe("invalid_client_metadata");
+      expect(undeclared.pulled.bytes).toBeLessThan(100_000);
+    });
+
+    it("drops a client nobody approved within 30 days when another one registers", async () => {
+      const neverApproved = await registerClient({ client_name: "Never approved" });
+      const connected = (await connect({ userId: ownerId })).clientId;
+      const awaitingExchange = await registerClient({ client_name: "Awaiting exchange" });
+      await approve({ userId: ownerId, clientId: awaitingExchange });
+      const recent = await registerClient({ client_name: "Recent" });
+      await db.prisma.oAuthClient.updateMany({
+        where: { id: { in: [neverApproved, connected, awaitingExchange] } },
+        data: { createdAt: new Date(Date.now() - 31 * 86_400_000) },
+      });
+
+      await registerClient();
+      const left = await db.prisma.oAuthClient.findMany({
+        where: { id: { in: [neverApproved, connected, awaitingExchange, recent] } },
+        select: { id: true },
+      });
+      expect(left.map((client) => client.id).sort()).toEqual(
+        [connected, awaitingExchange, recent].sort()
+      );
+    });
   });
 
   describe("authorize", () => {
@@ -196,6 +318,23 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       const res = await authorizeRequest(params);
       expect(res.status).toBe(302);
       expect(res.headers.get("location")).toBe(`${BASE_URL}/oauth/consent?${params}`);
+    });
+
+    it("hands the consent page the request it checked and nothing else", async () => {
+      signInAs(ownerId);
+      const clientId = await registerClient();
+      const params = authorizationParams({ clientId, challenge: pkce().challenge });
+      const sent = new URLSearchParams(params);
+      sent.append("client_id", "not-a-client");
+      sent.set("prompt", "consent");
+
+      const res = await authorizeRequest(sent);
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(`${BASE_URL}/oauth/consent?${params}`);
+
+      signOut();
+      const signIn = new URL((await authorizeRequest(sent)).headers.get("location")!);
+      expect(signIn.searchParams.get("callbackUrl")).toBe(`/api/oauth/authorize?${params}`);
     });
 
     it("never redirects for an unknown client or an unregistered redirect URI", async () => {
@@ -221,7 +360,8 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
 
     it("explains a request it cannot redirect in the person's interface language", async () => {
       const params = authorizationParams({ clientId: "not-a-client", challenge: pkce().challenge });
-      const res = await authorizeRequest(params, { Cookie: `${LOCALE_COOKIE}=zh-TW` });
+      useLocale("zh-TW");
+      const res = await authorizeRequest(params);
       expect(res.status).toBe(400);
       expect(await res.text()).toBe(zhTW["This app is not registered with OpenReply."]);
     });
@@ -247,6 +387,27 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(location.searchParams.get("state")).toBe(params.get("state") ? "keep-me" : null);
       expect(location.searchParams.get("iss")).toBe(BASE_URL);
       expect(location.searchParams.get("code")).toBeNull();
+    });
+
+    it("sends someone who is signed out to sign in before any error goes back to the client", async () => {
+      const clientId = await registerClient({ redirect_uris: ["https://evil.example/phish"] });
+      const params = authorizationParams({
+        clientId,
+        challenge: pkce().challenge,
+        redirectUri: "https://evil.example/phish",
+      });
+      params.set("response_type", "token");
+      const res = await authorizeRequest(params);
+      expect(res.status).toBe(302);
+      const location = new URL(res.headers.get("location")!);
+      expect(location.origin + location.pathname).toBe(`${BASE_URL}/login`);
+      expect(location.searchParams.get("callbackUrl")).toBe(`/api/oauth/authorize?${params}`);
+
+      // Once signed in, the same request is refused at the client's redirect URI.
+      signInAs(ownerId);
+      const signedIn = new URL((await authorizeRequest(params)).headers.get("location")!);
+      expect(signedIn.origin + signedIn.pathname).toBe("https://evil.example/phish");
+      expect(signedIn.searchParams.get("error")).toBe("unsupported_response_type");
     });
 
     it("lets a loopback client come back on another port", async () => {
@@ -401,15 +562,14 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(english.status).toBe(403);
       expect(await english.text()).toBe(message);
 
-      const chinese = await consentRequest(params, {
-        headers: { ...crossSite, Cookie: `${LOCALE_COOKIE}=zh-TW` },
-      });
+      useLocale("zh-TW");
+      const chinese = await consentRequest(params, { headers: crossSite });
       expect(chinese.status).toBe(403);
       expect(await chinese.text()).toBe(zhTW[message]);
 
       const edited = new URLSearchParams(params);
       edited.set("redirect_uri", "https://evil.example/cb");
-      const mismatch = await consentRequest(edited, { headers: { Cookie: `${LOCALE_COOKIE}=zh-TW` } });
+      const mismatch = await consentRequest(edited);
       expect(mismatch.status).toBe(400);
       expect(await mismatch.text()).toBe(
         zhTW["The redirect URI does not match the one this app registered."]
@@ -417,7 +577,8 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
 
       const member = await addMember(db.prisma, workspaceId, "MEMBER");
       signInAs(member.id);
-      const notAllowed = await consentRequest(params, { headers: { Cookie: `${LOCALE_COOKIE}=pt-BR` } });
+      useLocale("pt-BR");
+      const notAllowed = await consentRequest(params);
       expect(notAllowed.status).toBe(403);
       expect(await notAllowed.text()).toBe(ptBR["Only workspace owners and admins can connect apps."]);
     });
@@ -430,6 +591,86 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       const res = await consentRequest(params);
       expect(res.status).toBe(400);
       expect(res.headers.get("location")).toBeNull();
+    });
+  });
+
+  describe("the consent page", () => {
+    it("sends someone who is signed out to sign in before any error goes back to the client", async () => {
+      const clientId = await registerClient({ redirect_uris: ["https://evil.example/phish"] });
+      const params = authorizationParams({
+        clientId,
+        challenge: pkce().challenge,
+        redirectUri: "https://evil.example/phish",
+      });
+      params.set("response_type", "token");
+      const { location } = await consentPage(params);
+      expect(location).not.toBeNull();
+      const url = new URL(location!);
+      expect(url.origin + url.pathname).toBe(`${BASE_URL}/login`);
+      expect(url.searchParams.get("callbackUrl")).toBe(`/api/oauth/authorize?${params}`);
+
+      signInAs(ownerId);
+      const signedIn = new URL((await consentPage(params)).location!);
+      expect(signedIn.origin + signedIn.pathname).toBe("https://evil.example/phish");
+      expect(signedIn.searchParams.get("error")).toBe("unsupported_response_type");
+    });
+
+    it("reads a repeated parameter by its first value, as authorize does", async () => {
+      signInAs(ownerId);
+      const clientId = await registerClient();
+      const params = authorizationParams({ clientId, challenge: pkce().challenge });
+      params.append("client_id", "not-a-client");
+      const { location, html } = await consentPage(params);
+      expect(location).toBeNull();
+      expect(html).toContain("Connect Claude to OpenReply?");
+      expect(html).toContain(`name="client_id" value="${clientId}"`);
+      expect(html).not.toContain("not-a-client");
+    });
+
+    it("lets a member who cannot connect apps only cancel", async () => {
+      const member = await addMember(db.prisma, workspaceId, "MEMBER");
+      signInAs(member.id);
+      const clientId = await registerClient();
+      const { html } = await consentPage(authorizationParams({ clientId, challenge: pkce().challenge }));
+      expect(html).toContain("Only workspace owners and admins can connect apps.");
+      expect(html).toContain(`name="client_id" value="${clientId}"`);
+      expect(html).toContain('value="cancel"');
+      expect(html).not.toContain('value="allow"');
+      expect(html).not.toContain('name="grant"');
+    });
+
+    it("explains an unknown client in place, signed in or not", async () => {
+      const params = authorizationParams({ clientId: "not-a-client", challenge: pkce().challenge });
+      for (const signedIn of [false, true]) {
+        if (signedIn) signInAs(ownerId);
+        const { location, html } = await consentPage(params);
+        expect(location).toBeNull();
+        expect(html).toContain("This app is not registered with OpenReply.");
+      }
+    });
+
+    it("names where the person will be sent back to, scheme and all for an app's own scheme", async () => {
+      signInAs(ownerId);
+      const claude = await registerClient();
+      const claudePage = await consentPage(authorizationParams({ clientId: claude, challenge: pkce().challenge }));
+      expect(claudePage.html).toContain("sent back to claude.ai.");
+
+      // An app's own scheme can look like a website's name, with or without a
+      // host after it, so it is never shown as one.
+      const lookalikes = [
+        ["evilapp://claude.ai/callback", "evilapp://claude.ai/callback"],
+        ["claude.ai:/callback", "claude.ai:/callback"],
+        ["claude.ai:callback?from=claude.ai", "claude.ai:callback"],
+      ];
+      for (const [redirectUri, shown] of lookalikes) {
+        const lookalike = await registerClient({ redirect_uris: [redirectUri] });
+        const { html } = await consentPage(
+          authorizationParams({ clientId: lookalike, challenge: pkce().challenge, redirectUri })
+        );
+        expect(html).toContain("Connect Claude to OpenReply?");
+        expect(html).toContain(`sent back to ${shown}.`);
+        expect(html).not.toContain("sent back to claude.ai.");
+      }
     });
   });
 
@@ -494,6 +735,50 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect((await refresh(clientId, first.refresh_token)).status).toBe(400);
     });
 
+    it("revokes nothing for a used code presented without its verifier or redirect URI", async () => {
+      const clientId = await registerClient({ redirect_uris: [CLAUDE_REDIRECT, "https://claude.ai/other"] });
+      const { code, verifier } = await approve({ userId: ownerId, clientId });
+      const first = await (await exchange(clientId, code, verifier)).json();
+
+      const wrongVerifier = await exchange(clientId, code, pkce().verifier);
+      expect((await wrongVerifier.json()).error).toBe("invalid_grant");
+      const wrongRedirect = await exchange(clientId, code, verifier, "https://claude.ai/other");
+      expect((await wrongRedirect.json()).error).toBe("invalid_grant");
+
+      // Long after the code expired, too.
+      await db.prisma.oAuthAuthorizationCode.update({
+        where: { codeHash: hashOf(code) },
+        data: { expiresAt: new Date(Date.now() - 20 * 3_600_000) },
+      });
+      const late = await tokenRequest({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        code,
+        code_verifier: "x".repeat(43),
+      });
+      expect((await late.json()).error).toBe("invalid_grant");
+
+      expect((await mcpInitialize(`Bearer ${first.access_token}`)).status).toBe(200);
+      expect((await refresh(clientId, first.refresh_token)).status).toBe(200);
+    });
+
+    it("revokes the connection when the same code is exchanged twice at once", async () => {
+      for (let round = 0; round < 10; round++) {
+        const clientId = await registerClient();
+        const { code, verifier } = await approve({ userId: ownerId, clientId });
+        const results = await Promise.all([
+          exchange(clientId, code, verifier),
+          exchange(clientId, code, verifier),
+        ]);
+        expect(results.map((res) => res.status).sort()).toEqual([200, 400]);
+        const winner = await results.find((res) => res.status === 200)!.json();
+        expect((await mcpInitialize(`Bearer ${winner.access_token}`)).status).toBe(401);
+        const connections = await db.prisma.oAuthConnection.findMany({ where: { clientId } });
+        expect(connections).toHaveLength(1);
+        expect(connections[0].revokedAt).not.toBeNull();
+      }
+    });
+
     it("refuses an expired code", async () => {
       const clientId = await registerClient();
       const { code, verifier } = await approve({ userId: ownerId, clientId });
@@ -519,6 +804,44 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
     it("refuses an unsupported grant type", async () => {
       const res = await tokenRequest({ grant_type: "client_credentials", client_id: "x" });
       expect((await res.json()).error).toBe("unsupported_grant_type");
+    });
+
+    it("reads only form-encoded token requests", async () => {
+      const clientId = await registerClient();
+      const { code, verifier } = await approve({ userId: ownerId, clientId });
+      const res = await tokenRoute(
+        new Request(`${BASE_URL}/api/oauth/token`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            grant_type: "authorization_code",
+            client_id: clientId,
+            code,
+            redirect_uri: CLAUDE_REDIRECT,
+            code_verifier: verifier,
+          }),
+        })
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("invalid_request");
+
+      // The code is still good for a proper request.
+      expect((await exchange(clientId, code, verifier)).status).toBe(200);
+    });
+
+    it("refuses an oversized token request without reading all of it", async () => {
+      const form = "application/x-www-form-urlencoded";
+      const declared = streamedBody(5_000_000);
+      const res = await tokenRoute(streamedPost("/api/oauth/token", form, declared.body, 5_000_000));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("invalid_request");
+      expect(declared.pulled.bytes).toBeLessThan(10_000);
+
+      const undeclared = streamedBody(5_000_000);
+      const chunked = await tokenRoute(streamedPost("/api/oauth/token", form, undeclared.body));
+      expect(chunked.status).toBe(400);
+      expect((await chunked.json()).error).toBe("invalid_request");
+      expect(undeclared.pulled.bytes).toBeLessThan(100_000);
     });
   });
 
@@ -563,6 +886,49 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
         "invalid_grant"
       );
     });
+
+    it("leaves the refresh token usable when issuing its successor fails", async () => {
+      const tokens = await connect({ userId: ownerId });
+      const failOnce = vi
+        .spyOn(db.prisma, "$transaction")
+        .mockRejectedValueOnce(new Error("Transaction API error: unable to start a transaction"));
+      try {
+        await expect(refresh(tokens.clientId, tokens.refresh_token)).rejects.toThrow();
+      } finally {
+        failOnce.mockRestore();
+      }
+
+      const retry = await refresh(tokens.clientId, tokens.refresh_token);
+      expect(retry.status).toBe(200);
+      const next = await retry.json();
+      expect((await mcpInitialize(`Bearer ${next.access_token}`)).status).toBe(200);
+      const connection = await db.prisma.oAuthToken.findUniqueOrThrow({
+        where: { tokenHash: hashOf(next.access_token) },
+        select: { connection: { select: { revokedAt: true } } },
+      });
+      expect(connection.connection.revokedAt).toBeNull();
+    });
+
+    it("refuses a refresh, and revokes the connection, once its person can no longer manage the workspace", async () => {
+      const admin = await addMember(db.prisma, workspaceId, "ADMIN");
+      const tokens = await connect({ userId: admin.id });
+      const membership = { workspaceId_userId: { workspaceId, userId: admin.id } };
+      await db.prisma.workspaceMember.update({ where: membership, data: { role: "MEMBER" } });
+
+      const res = await refresh(tokens.clientId, tokens.refresh_token);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("invalid_grant");
+      const connections = await db.prisma.oAuthConnection.findMany({
+        where: { clientId: tokens.clientId },
+      });
+      expect(connections).toHaveLength(1);
+      expect(connections[0].revokedAt).not.toBeNull();
+
+      // Made an admin again, they have to connect again.
+      await db.prisma.workspaceMember.update({ where: membership, data: { role: "ADMIN" } });
+      expect((await mcpInitialize(`Bearer ${tokens.access_token}`)).status).toBe(401);
+      expect((await refresh(tokens.clientId, tokens.refresh_token)).status).toBe(400);
+    });
   });
 
   describe("Connected apps", () => {
@@ -595,6 +961,45 @@ describe.skipIf(!hasTestDatabase)("connecting the Claude app over OAuth", () => 
       expect(
         body.data.connections.filter((c: { clientName: string }) => c.clientName === "Reconnecting app")
       ).toHaveLength(1);
+    });
+
+    it("discards the tokens of the connection it replaces", async () => {
+      const clientId = await registerClient({ client_name: "Replaced tokens" });
+      const first = await connect({ userId: ownerId, clientId });
+      const { connectionId } = await db.prisma.oAuthToken.findUniqueOrThrow({
+        where: { tokenHash: hashOf(first.access_token) },
+      });
+      await connect({ userId: ownerId, clientId });
+
+      const replaced = await db.prisma.oAuthConnection.findUniqueOrThrow({ where: { id: connectionId } });
+      expect(replaced.revokedAt).not.toBeNull();
+      expect(await db.prisma.oAuthToken.count({ where: { connectionId } })).toBe(0);
+    });
+
+    it("replaces the earlier connection in the same step that creates the new one", async () => {
+      const clientId = await registerClient({ client_name: "Replaced at once" });
+      const first = await connect({ userId: ownerId, clientId });
+      const { code, verifier } = await approve({ userId: ownerId, clientId, grants: ["read"] });
+
+      // The database goes away just after the exchange's own transaction
+      // commits, so anything left to do after it fails.
+      const realTransaction = db.prisma.$transaction.bind(db.prisma);
+      const dropAfterExchange = vi
+        .spyOn(db.prisma, "$transaction")
+        .mockImplementationOnce(realTransaction)
+        .mockRejectedValueOnce(new Error("Server has closed the connection"));
+      let res: Response;
+      try {
+        res = await exchange(clientId, code, verifier);
+      } finally {
+        dropAfterExchange.mockRestore();
+      }
+
+      expect(res.status).toBe(200);
+      expect((await mcpInitialize(`Bearer ${first.access_token}`)).status).toBe(401);
+      expect((await refresh(clientId, first.refresh_token)).status).toBe(400);
+      const { access_token } = await res.json();
+      expect((await mcpInitialize(`Bearer ${access_token}`)).status).toBe(200);
     });
 
     it("revokes a connection, effective on its very next request", async () => {

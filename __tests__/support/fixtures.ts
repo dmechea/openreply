@@ -76,7 +76,8 @@ export async function connectInstagramAccount(
 /**
  * A campaign as the CSV import (app/api/automations/import) stores one. The
  * import does not check that postUrl is a URL, so such a campaign can break
- * rules a new campaign has to follow.
+ * rules a new campaign has to follow. Its public reply goes in the legacy
+ * single field only, leaving the list of variations empty.
  */
 export function importCampaign(
   prisma: PrismaClient,
@@ -86,6 +87,7 @@ export function importCampaign(
     postId,
     postUrl,
     keyword = "GUIDE",
+    publicReply = null,
     isActive = true,
   }: {
     workspaceId: string;
@@ -93,6 +95,7 @@ export function importCampaign(
     postId: string;
     postUrl: string | null;
     keyword?: string;
+    publicReply?: string | null;
     isActive?: boolean;
   }
 ) {
@@ -104,8 +107,8 @@ export function importCampaign(
       postUrl,
       keywords: [keyword],
       dmMessage: "Here is the guide",
-      publicReplyEnabled: false,
-      publicReplyMessage: null,
+      publicReplyEnabled: Boolean(publicReply),
+      publicReplyMessage: publicReply,
       isActive,
       wholeWordMatch: true,
       workspaceId,

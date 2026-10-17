@@ -3,8 +3,7 @@
 OpenReply defaults to English. Choose **English**, **繁體中文** or **Português (Brasil)** in the dashboard
 sidebar, under **Settings → Interface language**, or on the sign-in screen.
 The choice is stored in a browser cookie for one year and applies to the
-dashboard, sign-in screens, workspace invitations, shared campaign reports, and
-the consent page for connecting an app such as Claude.
+dashboard, sign-in screens, workspace invitations, and shared campaign reports.
 
 Changing the interface language does not translate campaign names, keywords,
 outgoing messages, button text, imported CSV data, or Instagram content. An

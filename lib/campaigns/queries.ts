@@ -93,7 +93,10 @@ type StoredCampaign = Automation & { trackedLinks: TrackedLink[] };
 
 /**
  * The settings both reads give alike, in the field names create and update
- * take. A link that is not set reads as null.
+ * take. A link that is not set reads as null. A campaign saved before public
+ * replies could vary, or by the CSV import, keeps its reply in the legacy
+ * single field only; it reads as the list, as the DM worker and the
+ * dashboard's edit page read it.
  */
 function campaignSettings(campaign: StoredCampaign) {
   const [primary, secondary]: (TrackedLink | undefined)[] = campaign.trackedLinks;
@@ -120,19 +123,26 @@ function campaignSettings(campaign: StoredCampaign) {
     followUpMessage: campaign.followUpMessage,
     followUpDelayMinutes: campaign.followUpDelayMinutes,
     publicReplyEnabled: campaign.publicReplyEnabled,
-    publicReplyMessages: campaign.publicReplyMessages,
+    publicReplyMessages:
+      campaign.publicReplyMessages.length > 0
+        ? campaign.publicReplyMessages
+        : campaign.publicReplyMessage
+          ? [campaign.publicReplyMessage]
+          : [],
   };
 }
 
-/** Every setting, in the field names create and update take, plus its stats. */
-export async function getCampaign(workspaceId: string, campaignId: string) {
-  const campaign = await findCampaign(workspaceId, campaignId);
-  if (!campaign) return null;
-  const stats = await campaignStats(workspaceId, [campaign.id]);
+type CampaignAccount = { id: string; username: string };
 
+/** Every setting, in the field names create and update take, plus its stats. */
+function campaignDetails(
+  campaign: StoredCampaign,
+  instagramAccount: CampaignAccount,
+  stats: CampaignStats
+) {
   return {
     id: campaign.id,
-    instagramAccount: campaign.instagramAccount,
+    instagramAccount,
     target: campaignTarget(campaign),
     ...campaignSettings(campaign),
     trackedLinks: campaign.trackedLinks.map((link) => ({
@@ -142,21 +152,37 @@ export async function getCampaign(workspaceId: string, campaignId: string) {
     reportShareEnabled: campaign.reportShareEnabled,
     createdAt: campaign.createdAt.toISOString(),
     updatedAt: campaign.updatedAt.toISOString(),
-    stats: stats.get(campaign.id) ?? EMPTY_STATS,
+    stats,
   };
 }
 
-/**
- * A stored campaign in the shape the create rules check, so an edit can be
- * checked as the campaign it would leave behind.
- */
-export async function getCampaignAsCreateInput(
-  workspaceId: string,
-  campaignId: string
-): Promise<Record<keyof CreateCampaignInput, unknown> | null> {
+export async function getCampaign(workspaceId: string, campaignId: string) {
   const campaign = await findCampaign(workspaceId, campaignId);
   if (!campaign) return null;
-  return {
+  const stats = await campaignStats(workspaceId, [campaign.id]);
+  return campaignDetails(campaign, campaign.instagramAccount, stats.get(campaign.id) ?? EMPTY_STATS);
+}
+
+/**
+ * A campaign just created, as getCampaign reads it, without reading it back:
+ * it has no DMs or clicks yet, and its links, numbered in button order as
+ * they were created, are put in that order.
+ */
+export function newCampaignDetails(campaign: StoredCampaign, instagramAccount: CampaignAccount) {
+  const trackedLinks = [...campaign.trackedLinks].sort((a, b) => a.position - b.position);
+  return campaignDetails({ ...campaign, trackedLinks }, instagramAccount, EMPTY_STATS);
+}
+
+/**
+ * A stored campaign as an edit needs it: its settings in the shape the create
+ * rules check, so the edit can be checked as the campaign it would leave
+ * behind; its account; and when it was last saved, so the edit can be written
+ * only if nothing else saved it in between.
+ */
+export async function getCampaignForEdit(workspaceId: string, campaignId: string) {
+  const campaign = await findCampaign(workspaceId, campaignId);
+  if (!campaign) return null;
+  const settings = {
     ...campaignSettings(campaign),
     instagramAccountId: campaign.instagramAccountId,
     postId: campaign.postId,
@@ -164,7 +190,17 @@ export async function getCampaignAsCreateInput(
     pendingNextReel: campaign.pendingNextReel,
     matchAnyPost: campaign.matchAnyPost,
     publicReplyMessage: campaign.publicReplyMessage,
-  };
+  } satisfies Record<keyof CreateCampaignInput, unknown>;
+  return { settings, instagramAccount: campaign.instagramAccount, updatedAt: campaign.updatedAt };
+}
+
+/** The account a campaign is on, or null when the workspace has no such campaign. */
+export async function getCampaignAccount(workspaceId: string, campaignId: string) {
+  const campaign = await prisma.automation.findFirst({
+    where: { id: campaignId, workspaceId },
+    select: { instagramAccount: { select: { id: true, username: true } } },
+  });
+  return campaign?.instagramAccount ?? null;
 }
 
 /** DMs that failed, newest first, with Instagram's reason. */

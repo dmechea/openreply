@@ -6,7 +6,7 @@ import {
   REFRESH_TOKEN_TTL_SECONDS,
 } from "@/lib/oauth/config";
 import { findClient } from "@/lib/oauth/clients";
-import { revokeConnection } from "@/lib/oauth/connections";
+import { approverCanManage, revokeConnection } from "@/lib/oauth/connections";
 import { generateSecret, hashSecret, verifyPkce } from "@/lib/oauth/secrets";
 
 /**
@@ -76,27 +76,10 @@ async function exchangeAuthorizationCode(params: URLSearchParams): Promise<Token
     return refuse("invalid_grant", "The authorization code is not valid");
   }
 
-  // Claim the code before anything else, so it works once even when two
-  // requests race, and a failed attempt burns it too.
-  const now = new Date();
-  const claimed = await prisma.oAuthAuthorizationCode.updateMany({
-    where: { id: stored.id, usedAt: null },
-    data: { usedAt: now },
-  });
-  if (claimed.count === 0) {
-    // A replayed code means it leaked, so whatever it was exchanged for goes
-    // too (RFC 6749 §4.1.2).
-    const replayed = await prisma.oAuthAuthorizationCode.findUnique({
-      where: { id: stored.id },
-      select: { connectionId: true },
-    });
-    if (replayed?.connectionId) await revokeConnection(replayed.connectionId);
-    return refuse("invalid_grant", "The authorization code has already been used");
-  }
-
-  if (stored.expiresAt <= now) {
-    return refuse("invalid_grant", "The authorization code has expired");
-  }
+  // The redirect URI and PKCE verifier are checked before the code is
+  // touched, and only whoever made the authorization request holds the
+  // verifier, so a leaked code alone can neither spend it nor revoke what it
+  // gave out.
   const redirectUri = params.get("redirect_uri");
   const redirectMatches =
     redirectUri === null
@@ -109,17 +92,30 @@ async function exchangeAuthorizationCode(params: URLSearchParams): Promise<Token
     return refuse("invalid_grant", "The code_verifier does not match the code_challenge");
   }
 
-  const body = await prisma.$transaction(async (tx) => {
-    // Approving the same app again replaces its earlier connection.
-    await tx.oAuthConnection.updateMany({
-      where: {
-        clientId: client.id,
-        userId: stored.userId,
-        workspaceId: stored.workspaceId,
-        revokedAt: null,
-      },
-      data: { revokedAt: now },
+  // Claiming the code and creating its connection are one transaction, so the
+  // code works once even when two requests race, and the one that loses
+  // always finds the connection the other created.
+  const now = new Date();
+  const outcome = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.oAuthAuthorizationCode.updateMany({
+      where: { id: stored.id, usedAt: null },
+      data: { usedAt: now },
     });
+    if (claimed.count === 0) return "used" as const;
+    if (stored.expiresAt <= now) return "expired" as const;
+
+    // Approving the same app again replaces its earlier connection, tokens
+    // and all. Doing it in this transaction means the old connection and its
+    // scopes can never stay live beside the new one.
+    const earlier: Prisma.OAuthConnectionWhereInput = {
+      clientId: client.id,
+      userId: stored.userId,
+      workspaceId: stored.workspaceId,
+      revokedAt: null,
+    };
+    await tx.oAuthToken.deleteMany({ where: { connection: earlier } });
+    await tx.oAuthConnection.updateMany({ where: earlier, data: { revokedAt: now } });
+
     const connection = await tx.oAuthConnection.create({
       data: {
         clientId: client.id,
@@ -134,7 +130,21 @@ async function exchangeAuthorizationCode(params: URLSearchParams): Promise<Token
     });
     return issueTokenPair(tx, connection, null);
   });
-  return { ok: true, body };
+
+  if (outcome === "used") {
+    // A replayed code means it leaked, so whatever it was exchanged for goes
+    // too (RFC 6749 §4.1.2).
+    const replayed = await prisma.oAuthAuthorizationCode.findUnique({
+      where: { id: stored.id },
+      select: { connectionId: true },
+    });
+    if (replayed?.connectionId) await revokeConnection(replayed.connectionId);
+    return refuse("invalid_grant", "The authorization code has already been used");
+  }
+  if (outcome === "expired") {
+    return refuse("invalid_grant", "The authorization code has expired");
+  }
+  return { ok: true, body: outcome };
 }
 
 async function refreshAccessToken(params: URLSearchParams): Promise<TokenResult> {
@@ -157,33 +167,44 @@ async function refreshAccessToken(params: URLSearchParams): Promise<TokenResult>
     return refuse("invalid_grant", "The refresh token is not valid");
   }
 
+  // A connection acts as the person who approved it, so it ends once they can
+  // no longer manage the workspace, instead of refreshing on regardless.
+  if (!(await approverCanManage(token.connection))) {
+    await revokeConnection(token.connectionId);
+    return refuse(
+      "invalid_grant",
+      "The person who approved this connection can no longer manage the workspace"
+    );
+  }
+
+  // Spending the presented token and issuing its successor are one
+  // transaction, so if issuing fails the token stays unspent and the client
+  // can try again. A token already spent, a moment ago or long since, has
+  // been used twice.
   const now = new Date();
-  if (token.rotatedAt) {
-    await revokeConnection(token.connectionId);
-    return refuse("invalid_grant", "The refresh token has already been used");
-  }
-  if (token.expiresAt <= now) {
-    return refuse("invalid_grant", "The refresh token has expired");
-  }
+  const outcome = await prisma.$transaction(async (tx) => {
+    const spent = await tx.oAuthToken.updateMany({
+      where: { id: token.id, rotatedAt: null },
+      data: { rotatedAt: now },
+    });
+    if (spent.count === 0) return "used" as const;
+    if (token.expiresAt <= now) return "expired" as const;
 
-  const spent = await prisma.oAuthToken.updateMany({
-    where: { id: token.id, rotatedAt: null },
-    data: { rotatedAt: now },
-  });
-  if (spent.count === 0) {
-    // Another request spent it a moment ago: the same token used twice.
-    await revokeConnection(token.connectionId);
-    return refuse("invalid_grant", "The refresh token has already been used");
-  }
-
-  const body = await prisma.$transaction(async (tx) => {
     // Housekeeping: expired tokens can never be used or replayed again.
     await tx.oAuthToken.deleteMany({
       where: { connectionId: token.connectionId, expiresAt: { lt: now } },
     });
     return issueTokenPair(tx, token.connection, token.id);
   });
-  return { ok: true, body };
+
+  if (outcome === "used") {
+    await revokeConnection(token.connectionId);
+    return refuse("invalid_grant", "The refresh token has already been used");
+  }
+  if (outcome === "expired") {
+    return refuse("invalid_grant", "The refresh token has expired");
+  }
+  return { ok: true, body: outcome };
 }
 
 export async function handleTokenRequest(params: URLSearchParams): Promise<TokenResult> {

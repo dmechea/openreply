@@ -1,15 +1,15 @@
 import { NextResponse, type NextRequest } from "next/server";
 import {
-  AUTHORIZATION_PARAMS,
   AUTHORIZATION_PROBLEMS,
   authorizationResponseUrl,
   checkAuthorizationRequest,
   grantedScopes,
   issueAuthorizationCode,
+  readAuthorizationParams,
   signInUrl,
 } from "@/lib/oauth/authorization";
 import { issuer } from "@/lib/oauth/config";
-import { plainText, requestI18n } from "@/lib/oauth/browser";
+import { refusal } from "@/lib/oauth/browser";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
@@ -29,22 +29,16 @@ function isSameOriginForm(request: NextRequest) {
 // The consent page's form: approve or cancel an authorization request. The
 // request is checked again here, since the form fields came from the browser.
 export async function POST(request: NextRequest) {
-  const { t } = requestI18n(request);
   if (!isSameOriginForm(request)) {
-    return plainText(t("This approval must come from the OpenReply consent page."), 403);
+    return refusal("This approval must come from the OpenReply consent page.", 403);
   }
 
   const form = await request.formData();
-  const params = new URLSearchParams();
-  for (const name of AUTHORIZATION_PARAMS) {
-    const value = form.get(name);
-    if (typeof value === "string") params.set(name, value);
-  }
-
+  const params = readAuthorizationParams((name) => form.get(name));
   const check = await checkAuthorizationRequest(params);
   if (!check.ok) {
     if (check.redirectTo !== null) return NextResponse.redirect(check.redirectTo, 303);
-    return plainText(t(AUTHORIZATION_PROBLEMS[check.problem]), 400);
+    return refusal(AUTHORIZATION_PROBLEMS[check.problem], 400);
   }
   const { redirectUri, state } = check.request;
 
@@ -62,7 +56,7 @@ export async function POST(request: NextRequest) {
   const context = await getCurrentWorkspaceContext();
   if (!context) return NextResponse.redirect(signInUrl(params), 303);
   if (!canManageWorkspace(context.role)) {
-    return plainText(t("Only workspace owners and admins can connect apps."), 403);
+    return refusal("Only workspace owners and admins can connect apps.", 403);
   }
 
   const ticked = form.getAll("grant").filter((value) => typeof value === "string");

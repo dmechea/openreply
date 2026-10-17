@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { Automation } from "@/app/generated/prisma/client";
 
 /**
@@ -12,11 +13,29 @@ export type CampaignTarget =
   | { type: "any_post" }
   | { type: "next_reel" };
 
-/** A target as someone chooses it, so a post target always names its post. */
-export type ChosenTarget =
-  | { type: "post"; postId: string; postUrl?: string | null }
-  | { type: "any_post" }
-  | { type: "next_reel" };
+/**
+ * A target as someone chooses it, so a post target always names its post.
+ * The MCP tools take it in this shape, described for the client.
+ */
+export const chosenTargetSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("post"),
+    postId: z
+      .string()
+      .min(1)
+      .describe("The post's or reel's id, from list_posts for the campaign's account"),
+    postUrl: z
+      .url()
+      .optional()
+      .describe(
+        "Its permalink from list_posts, shown in the dashboard. When left out, the campaign's current post keeps its own, and another post's is taken from Instagram"
+      ),
+  }),
+  z.object({ type: z.literal("any_post") }),
+  z.object({ type: z.literal("next_reel") }),
+]);
+
+export type ChosenTarget = z.infer<typeof chosenTargetSchema>;
 
 export function campaignTarget(
   campaign: Pick<Automation, "pendingNextReel" | "matchAnyPost" | "postId" | "postUrl">
@@ -28,7 +47,8 @@ export function campaignTarget(
 
 /**
  * The flags a chosen target sets, in the field names create and update take.
- * Any post and the next reel name no post; the write clears the stored one.
+ * Any post and the next reel name no post, so they clear the stored one, as
+ * the write would.
  */
 export function targetFlags(target: ChosenTarget) {
   switch (target.type) {
@@ -40,8 +60,8 @@ export function targetFlags(target: ChosenTarget) {
         pendingNextReel: false,
       };
     case "any_post":
-      return { matchAnyPost: true, pendingNextReel: false };
+      return { postId: null, postUrl: null, matchAnyPost: true, pendingNextReel: false };
     case "next_reel":
-      return { pendingNextReel: true, matchAnyPost: false };
+      return { postId: null, postUrl: null, pendingNextReel: true, matchAnyPost: false };
   }
 }

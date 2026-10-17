@@ -59,17 +59,27 @@ export function authorizationServerMetadata() {
   };
 }
 
+// Why the MCP endpoint refused a request: with no token at all, or with one
+// it does not accept.
+const MCP_REFUSALS = {
+  missing: { error: "unauthorized", description: "Connect this app to OpenReply to use it" },
+  invalid: { error: "invalid_token", description: "The access token is missing, expired or revoked" },
+} as const;
+
 /**
- * The challenge on a 401 from the MCP endpoint, pointing the client at the
- * metadata that tells it where to sign in (RFC 9728 §5.1).
+ * A 401 from the MCP endpoint. Its challenge points the client at the
+ * metadata that tells it where to sign in (RFC 9728 §5.1), and names the
+ * error only for a token it refused, not when none was sent (RFC 6750 §3.1).
  */
-export function bearerChallenge(invalidToken: boolean): string {
-  const parts = [
-    ...(invalidToken
-      ? ['error="invalid_token"', 'error_description="The access token is missing, expired or revoked"']
-      : []),
+export function mcpUnauthorized(reason: keyof typeof MCP_REFUSALS): Response {
+  const { error, description } = MCP_REFUSALS[reason];
+  const challenge = [
+    ...(reason === "invalid" ? [`error="${error}"`, `error_description="${description}"`] : []),
     `resource_metadata="${protectedResourceMetadataUrl()}"`,
     `scope="${SCOPES.join(" ")}"`,
   ];
-  return `Bearer ${parts.join(", ")}`;
+  return Response.json(
+    { error, error_description: description },
+    { status: 401, headers: { "WWW-Authenticate": `Bearer ${challenge.join(", ")}` } }
+  );
 }

@@ -18,25 +18,55 @@ interface ConnectionsData {
   canManage: boolean;
 }
 
+/**
+ * The JSON answer from `path`, or null when the request fails or the answer
+ * is not JSON, such as an empty 500 or a proxy's error page.
+ */
+function getJson(path: string) {
+  return fetch(path, { cache: "no-store" })
+    .then((res) => res.json())
+    .catch(() => null);
+}
+
+interface Loaded {
+  data: ConnectionsData | null;
+  connectorUrl: string | null;
+}
+
+/** The workspace's connections and the connector URL, each null when it did not load. */
+async function fetchConnectedApps(): Promise<Loaded> {
+  const [payload, metadata] = await Promise.all([
+    getJson("/api/oauth/connections"),
+    // The connector URL is the MCP endpoint's resource identifier, which the
+    // server builds from NEXTAUTH_URL. Reading it from the endpoint's
+    // metadata, not this page's address, keeps it right when the page is open
+    // on another host that serves the same deployment.
+    getJson("/.well-known/oauth-protected-resource/api/mcp"),
+  ]);
+  return {
+    data: payload?.success ? payload.data : null,
+    connectorUrl: typeof metadata?.resource === "string" ? metadata.resource : null,
+  };
+}
+
 /** Settings → Connected apps: OAuth connections to the MCP endpoint. */
 export function ConnectedApps() {
   const { t, locale } = useI18n();
   const [data, setData] = useState<ConnectionsData | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [connectorUrl, setConnectorUrl] = useState("");
 
-  async function load() {
-    const res = await fetch("/api/oauth/connections", { cache: "no-store" });
-    const payload = await res.json();
-    if (payload.success) setData(payload.data);
+  // A failed reload keeps the last list and URL on screen and says it failed.
+  function show(loaded: Loaded) {
+    if (loaded.data) setData(loaded.data);
+    if (loaded.connectorUrl) setConnectorUrl(loaded.connectorUrl);
+    setLoadFailed(!loaded.data || !loaded.connectorUrl);
   }
 
   useEffect(() => {
-    // Reads the browser's own origin, which only exists after mounting.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setConnectorUrl(`${window.location.origin}/api/mcp`);
-    void load();
+    void fetchConnectedApps().then(show);
   }, []);
 
   const scopeLabels: Record<Scope, string> = {
@@ -49,12 +79,19 @@ export function ConnectedApps() {
     if (!confirm(t("Revoke this connection? The app loses access immediately."))) return;
     setError(null);
     setBusy(id);
-    const res = await fetch(`/api/oauth/connections?id=${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    });
-    const payload = await res.json();
-    if (!payload.success) setError(payload.error ?? t("Could not revoke the connection"));
-    await load();
+    try {
+      const res = await fetch(`/api/oauth/connections?id=${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      const payload = await res.json();
+      if (!payload.success) setError(payload.error ?? t("Could not revoke the connection"));
+    } catch {
+      // No readable answer: the request failed, or the server or a proxy sent
+      // an error without JSON.
+      setError(t("Could not revoke the connection"));
+    }
+    // Reload either way, since a lost answer may still have revoked it.
+    show(await fetchConnectedApps());
     setBusy(null);
   }
 
@@ -74,7 +111,8 @@ export function ConnectedApps() {
           <button
             type="button"
             onClick={() => void navigator.clipboard?.writeText(connectorUrl)}
-            className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted transition-colors hover:border-border-hover hover:text-foreground"
+            disabled={!connectorUrl}
+            className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted transition-colors hover:border-border-hover hover:text-foreground disabled:opacity-50"
           >
             {t("Copy")}
           </button>
@@ -121,7 +159,7 @@ export function ConnectedApps() {
             {data.canManage && (
               <button
                 type="button"
-                onClick={() => revoke(connection.id)}
+                onClick={() => void revoke(connection.id)}
                 disabled={busy === connection.id}
                 className="inline-flex items-center justify-center rounded border border-error/20 px-4 py-2 text-sm font-medium text-error transition-all hover:border-error/40 hover:bg-error/10 disabled:opacity-50"
               >
@@ -131,6 +169,7 @@ export function ConnectedApps() {
           </div>
         ))}
         {error && <p className="text-sm text-error">{error}</p>}
+        {loadFailed && <p className="text-sm text-error">{t("Could not load connected apps")}</p>}
       </div>
     </section>
   );

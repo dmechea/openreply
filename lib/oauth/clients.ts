@@ -33,7 +33,7 @@ function isLoopback(url: URL) {
  * loopback address (CLI clients such as Claude Code), or a native app's own
  * scheme. Never a fragment (RFC 6749 §3.1.2).
  */
-export function isAllowedRedirectUri(value: string): boolean {
+function isAllowedRedirectUri(value: string): boolean {
   let url: URL;
   try {
     url = new URL(value);
@@ -129,12 +129,23 @@ export async function registerClient(metadata: unknown): Promise<RegistrationRes
     };
   }
 
-  const client = await prisma.oAuthClient.create({
-    data: {
-      name: client_name?.trim() || "Unnamed app",
-      redirectUris: redirect_uris,
-    },
-  });
+  const [, client] = await prisma.$transaction([
+    // Housekeeping: anyone may register, so a client that 30 days on has
+    // neither a connection nor an authorization code goes.
+    prisma.oAuthClient.deleteMany({
+      where: {
+        createdAt: { lt: new Date(Date.now() - 30 * 86_400_000) },
+        connections: { none: {} },
+        authorizationCodes: { none: {} },
+      },
+    }),
+    prisma.oAuthClient.create({
+      data: {
+        name: client_name?.trim() || "Unnamed app",
+        redirectUris: redirect_uris,
+      },
+    }),
+  ]);
 
   return {
     ok: true,

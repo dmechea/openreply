@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { Prisma } from "@/app/generated/prisma/client";
 import { prisma } from "@/lib/db/client";
 import {
   buildInitialCampaignLinks,
   syncCampaignLinks,
 } from "@/lib/campaigns/links";
+import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import { generateReportShareSlug } from "@/lib/reports/share";
 
 /**
@@ -121,10 +123,18 @@ export const updateCampaignSchema = z.object({
 export type CreateCampaignInput = z.output<typeof createCampaignSchema>;
 export type UpdateCampaignInput = z.output<typeof updateCampaignSchema>;
 
-/** Why a write was refused, with the message the dashboard has always shown. */
+/**
+ * Why a write was refused, with the message the dashboard has always shown.
+ * The dashboard never asks for an edit to wait on the stored version, so it
+ * never gets campaign_changed.
+ */
 export type CampaignRefusal = {
   ok: false;
-  reason: "workspace_not_found" | "instagram_not_connected" | "campaign_not_found";
+  reason:
+    | "workspace_not_found"
+    | "instagram_not_connected"
+    | "campaign_not_found"
+    | "campaign_changed";
   message: string;
 };
 
@@ -132,24 +142,13 @@ export async function createCampaign(
   workspaceId: string,
   input: CreateCampaignInput
 ) {
-  const requestedInstagramAccountId =
-    input.instagramAccountId && input.instagramAccountId !== "all"
-      ? input.instagramAccountId
-      : null;
-
+  // The account asked for, or the workspace's main one without it (or with "all").
   const [workspace, instagramAccount] = await Promise.all([
     prisma.workspace.findUnique({
       where: { id: workspaceId },
       select: { id: true },
     }),
-    requestedInstagramAccountId
-      ? prisma.instagramAccount.findFirst({
-          where: { id: requestedInstagramAccountId, workspaceId },
-        })
-      : prisma.instagramAccount.findFirst({
-          where: { workspaceId },
-          orderBy: { connectedAt: "desc" },
-        }),
+    getWorkspaceInstagramAccount(workspaceId, input.instagramAccountId),
   ]);
 
   if (!workspace) {
@@ -249,24 +248,95 @@ export async function createCampaign(
 }
 
 /**
+ * An edit as it is written: the fields that depend on the ones it changes are
+ * brought in line with them.
+ */
+function withDependentFieldsCleared(input: UpdateCampaignInput) {
+  const edit = { ...input };
+
+  // Keep dependent fields consistent: any-word clears keywords; a disabled
+  // opening DM clears its message and button.
+  if (edit.matchAnyWord === true) edit.keywords = [];
+  if (edit.openingDmEnabled === false) {
+    edit.openingDmMessage = null;
+    edit.openingDmButtonLabel = null;
+  }
+  if (edit.requireFollow === false) {
+    edit.followPromptMessage = null;
+    edit.followPromptButtonLabel = null;
+  }
+  if (edit.followUpEnabled === false) {
+    edit.followUpMessage = null;
+    edit.followUpDelayMinutes = 0;
+  }
+  // Any-post / next-reel campaigns carry no specific post.
+  if (edit.matchAnyPost === true || edit.pendingNextReel === true) {
+    edit.postId = null;
+    edit.postUrl = null;
+  }
+  // Keep the public-reply variations list and the legacy single field in sync.
+  if (edit.publicReplyMessages !== undefined) {
+    const list = edit.publicReplyMessages
+      .map((m) => m.trim())
+      .filter(Boolean);
+    edit.publicReplyMessages = list;
+    edit.publicReplyMessage = list[0] ?? null;
+  }
+  if (edit.publicReplyEnabled === false) {
+    edit.publicReplyMessages = [];
+    edit.publicReplyMessage = null;
+  }
+  return edit;
+}
+
+const issueKey = (issue: z.core.$ZodIssue) => `${issue.path.join(".")}: ${issue.message}`;
+
+/**
+ * The create rules an edit would break, checked on the campaign it would
+ * leave behind. Rules the stored campaign already breaks are left out, so a
+ * campaign saved before a rule existed, or by the CSV import (which does not
+ * check its post link), still takes every edit that leaves that alone. The
+ * MCP tools refuse an edit that breaks one; the dashboard does not check.
+ */
+export function editIssues(stored: Record<string, unknown>, input: UpdateCampaignInput) {
+  const before = createCampaignSchema.safeParse(stored);
+  const known = new Set(before.success ? [] : before.error.issues.map(issueKey));
+  const changes = Object.entries(withDependentFieldsCleared(input)).filter(
+    ([, value]) => value !== undefined
+  );
+  const after = createCampaignSchema.safeParse({ ...stored, ...Object.fromEntries(changes) });
+  return after.success ? [] : after.error.issues.filter((issue) => !known.has(issueKey(issue)));
+}
+
+/**
  * Apply an edit to one of the workspace's campaigns. Switching a campaign on
  * or off is an edit of `isActive` alone.
+ *
+ * With `unchangedSince`, the edit is written only if the campaign was last
+ * saved at that time, so checks made against that version still hold; if it
+ * was saved since, or is not one of the workspace's campaigns, nothing is
+ * written and the refusal is campaign_changed.
  */
 export async function updateCampaign(
   workspaceId: string,
   campaignId: string,
-  input: UpdateCampaignInput
+  input: UpdateCampaignInput,
+  { unchangedSince }: { unchangedSince?: Date } = {}
 ) {
-  const existing = await prisma.automation.findFirst({
-    where: { id: campaignId, workspaceId },
-  });
+  // An edit waiting on a version its caller has just read needs no lookup:
+  // the write below matches only that version, in this workspace.
+  if (!unchangedSince) {
+    const existing = await prisma.automation.findFirst({
+      where: { id: campaignId, workspaceId },
+    });
 
-  if (!existing) {
-    return {
-      ok: false,
-      reason: "campaign_not_found",
-      message: "Campaign not found",
-    } satisfies CampaignRefusal;
+    if (!existing) {
+      return {
+        ok: false,
+        reason: "campaign_not_found",
+        message: "Campaign not found",
+      } satisfies CampaignRefusal;
+    }
   }
 
   const {
@@ -274,60 +344,53 @@ export async function updateCampaign(
     secondaryDestinationUrl,
     secondaryButtonLabel,
     ...automationData
-  } = input;
-
-  // Keep dependent fields consistent: any-word clears keywords; a disabled
-  // opening DM clears its message and button.
-  if (automationData.matchAnyWord === true) automationData.keywords = [];
-  if (automationData.openingDmEnabled === false) {
-    automationData.openingDmMessage = null;
-    automationData.openingDmButtonLabel = null;
-  }
-  if (automationData.requireFollow === false) {
-    automationData.followPromptMessage = null;
-    automationData.followPromptButtonLabel = null;
-  }
-  if (automationData.followUpEnabled === false) {
-    automationData.followUpMessage = null;
-    automationData.followUpDelayMinutes = 0;
-  }
-  // Any-post / next-reel campaigns carry no specific post.
-  if (automationData.matchAnyPost === true || automationData.pendingNextReel === true) {
-    automationData.postId = null;
-    automationData.postUrl = null;
-  }
-  // Keep the public-reply variations list and the legacy single field in sync.
-  if (automationData.publicReplyMessages !== undefined) {
-    const list = automationData.publicReplyMessages
-      .map((m) => m.trim())
-      .filter(Boolean);
-    automationData.publicReplyMessages = list;
-    automationData.publicReplyMessage = list[0] ?? null;
-  }
-  if (automationData.publicReplyEnabled === false) {
-    automationData.publicReplyMessages = [];
-    automationData.publicReplyMessage = null;
-  }
+  } = withDependentFieldsCleared(input);
 
   // One transaction, so a save never lands half applied. Updating the campaign
   // first locks its row, which makes a second save of the same campaign wait
   // for this one before it reads the links.
-  const updated = await prisma.$transaction(async (tx) => {
-    const campaign = await tx.automation.update({
-      where: { id: campaignId },
-      data: automationData,
+  try {
+    const updated = await prisma.$transaction(async (tx) => {
+      const campaign = await tx.automation.update({
+        where: {
+          id: campaignId,
+          workspaceId,
+          ...(unchangedSince ? { updatedAt: unchangedSince } : {}),
+        },
+        // An edit of only the links has nothing else to write, and without a
+        // write the row is neither locked nor marked saved. So an edit waiting
+        // on a version always marks a new one, which another edit read before
+        // it then sees as a change.
+        data: unchangedSince ? { ...automationData, updatedAt: new Date() } : automationData,
+      });
+
+      await syncCampaignLinks(tx, {
+        workspaceId,
+        automationId: campaignId,
+        primaryUrl: trackedDestinationUrl,
+        secondaryUrl: secondaryDestinationUrl,
+        secondaryLabel: secondaryButtonLabel,
+      });
+
+      return campaign;
     });
 
-    await syncCampaignLinks(tx, {
-      workspaceId,
-      automationId: campaignId,
-      primaryUrl: trackedDestinationUrl,
-      secondaryUrl: secondaryDestinationUrl,
-      secondaryLabel: secondaryButtonLabel,
-    });
-
-    return campaign;
-  });
-
-  return { ok: true as const, campaign: updated };
+    return { ok: true as const, campaign: updated };
+  } catch (error) {
+    // No row matched the stored version: the campaign was saved, or deleted,
+    // meanwhile.
+    if (
+      unchangedSince &&
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2025"
+    ) {
+      return {
+        ok: false,
+        reason: "campaign_changed",
+        message:
+          "The campaign was changed meanwhile, so this edit was not saved. Read it again and try again.",
+      } satisfies CampaignRefusal;
+    }
+    throw error;
+  }
 }
