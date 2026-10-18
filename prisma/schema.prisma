@@ -23,6 +23,8 @@ model User {
   ownedWorkspaces   Workspace[]       @relation("WorkspaceOwner")
   workspaceMembers  WorkspaceMember[]
   sentInvitations   WorkspaceInvitation[] @relation("WorkspaceInvitationsSent")
+  oauthAuthorizationCodes OAuthAuthorizationCode[]
+  oauthConnections        OAuthConnection[]
 }
 
 model Account {
@@ -85,6 +87,8 @@ model Workspace {
   linkClicks        LinkClick[]
   webhookEvents     WebhookEvent[]
   operationalEvents OperationalEvent[]
+  oauthAuthorizationCodes OAuthAuthorizationCode[]
+  oauthConnections        OAuthConnection[]
 
   @@index([ownerId])
 }
@@ -418,4 +422,93 @@ model ZernioConnection {
 model PostbackDelivery {
   id String @id
   createdAt DateTime @default(now())
+}
+
+// --- OAuth for the MCP endpoint ---------------------------------------------
+// OpenReply is its own small OAuth authorization server for /api/mcp, on top of
+// the NextAuth login. Every secret it hands out (codes, access and refresh
+// tokens) is a random string stored here only as its SHA-256 hash.
+
+/// A client registered itself through dynamic client registration, such as
+/// the Claude app. Public clients only, so there is no client secret.
+model OAuthClient {
+  /// The client_id.
+  id           String   @id @default(cuid())
+  name         String
+  redirectUris String[]
+  createdAt    DateTime @default(now())
+
+  authorizationCodes OAuthAuthorizationCode[]
+  connections        OAuthConnection[]
+}
+
+/// Issued when someone approves the consent page; exchanged once for tokens.
+model OAuthAuthorizationCode {
+  id            String    @id @default(cuid())
+  codeHash      String    @unique
+  clientId      String
+  userId        String
+  workspaceId   String
+  scopes        String[]
+  redirectUri   String
+  /// PKCE S256 challenge the token request's code_verifier must match.
+  codeChallenge String
+  expiresAt     DateTime
+  usedAt        DateTime?
+  /// The connection its exchange created, revoked if the code is replayed.
+  connectionId  String?
+  createdAt     DateTime  @default(now())
+
+  client    OAuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([expiresAt])
+}
+
+/// One grant from one client to one workspace, with its scopes. Listed in
+/// Settings as a connected app; revoking it stops its tokens at once.
+model OAuthConnection {
+  id          String    @id @default(cuid())
+  clientId    String
+  userId      String
+  workspaceId String
+  scopes      String[]
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+
+  client    OAuthClient  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  tokens    OAuthToken[]
+
+  @@index([workspaceId])
+  @@index([userId])
+  @@index([clientId])
+}
+
+model OAuthToken {
+  id           String         @id @default(cuid())
+  connectionId String
+  kind         OAuthTokenKind
+  tokenHash    String         @unique
+  expiresAt    DateTime
+  /// Set once a refresh token has been exchanged for a new pair. Presenting
+  /// it again means it leaked, and revokes the whole connection, unless it
+  /// comes back within REFRESH_REUSE_GRACE_SECONDS (lib/oauth/config.ts).
+  rotatedAt    DateTime?
+  /// The refresh token this one was issued in exchange for, if any.
+  parentId     String?
+  createdAt    DateTime       @default(now())
+
+  connection OAuthConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId])
+}
+
+enum OAuthTokenKind {
+  ACCESS
+  REFRESH
 }
